@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to team_config.json next to team_setup.py and edit. Keys starting with _ are ignored.",
+
+  "nexus_remote": "nexus",
+  "nexus_url": "https://nexus.mycompany.local/repository/conan-hosted/",
+  "raw_url": "https://nexus.mycompany.local/repository/conan-sources/",
+
+  "_disable_remotes": "Remotes to disable (not delete) so Conan only talks to Nexus.",
+  "disable_remotes": ["conancenter"],
+
+  "_msvc_fallbacks": "Compiler version -> older version whose binaries it may use. {} to turn off.",
+  "msvc_fallbacks": {
+    "195": "194",
+    "194": "193"
+  }
+}

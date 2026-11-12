@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+team_config.json
+team-config.zip
