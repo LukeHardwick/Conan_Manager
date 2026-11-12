@@ -137,7 +137,8 @@ install as usual. They never see the `internal` remote or this repository.
 
 If they need a profile that wasn't mirrored, `--build=missing` builds it from the recipe and
 source in Nexus. That only works if the raw repo allows anonymous read, because
-`team_setup.py` does not give developers credentials for it.
+the team config does not give developers credentials for it. The *Verify* step after
+mirroring checks exactly this.
 
 ---
 

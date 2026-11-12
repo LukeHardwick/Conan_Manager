@@ -21,6 +21,8 @@ through environment variables.
 """
 from __future__ import annotations
 
+import argparse
+import getpass
 import json
 import os
 import queue
@@ -30,7 +32,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,9 +40,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import internal_recipes as ir
+import team_config as tc
 
 APP_NAME = "Conan Mirror"
 HERE = Path(__file__).resolve().parent
+MANIFEST_FILE = HERE / "mirror.json"
 CONFIG_DIR = Path.home() / ".conan_mirror"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 WORK_DIR = CONFIG_DIR / "work"
@@ -61,6 +64,8 @@ DEFAULTS = {
     "nexus_user": "",
     "internal_remote": "internal",   # local-recipes-index remote for ./recipes
     "build_profile": "",             # Release profile for build tools; empty = same as host
+    "conan_home": str(ir.DEFAULT_CONAN_HOME),   # the mirror's own Conan home; empty = your normal one
+    "msvc_fallbacks": dict(tc.DEFAULT_FALLBACKS),  # newer MSVC -> older MSVC whose binaries it may use
 }
 
 
@@ -132,7 +137,8 @@ class Conan:
     def env(self) -> dict:
         return ir.conan_env(self.app.settings, *self.app.creds)
 
-    def run(self, args: list[str], check: bool = True, quiet: bool = False) -> str:
+    def run(self, args: list[str], check: bool = True, quiet: bool = False,
+            env: dict | None = None) -> str:
         if self.cancelled:
             raise Cancelled()
         exe = shutil.which(self.app.settings["conan_exe"] or "conan") or self.app.settings["conan_exe"]
@@ -144,7 +150,7 @@ class Conan:
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                                 errors="replace", env=self.env(), cwd=WORK_DIR, **kw)
+                                 errors="replace", env=env or self.env(), cwd=WORK_DIR, **kw)
         except OSError as e:
             raise ConanError(f"Could not run '{exe}': {e}. Set the Conan executable in Settings.")
         self.proc = p
@@ -219,12 +225,84 @@ def source_remotes(conan: Conan, s: dict) -> list[str]:
     return ([internal] if internal and internal in enabled else []) + [s["center_remote"]]
 
 
+def conanfile_path(ref: str) -> Path | None:
+    """The conanfile a mirror entry points at, or None if the entry is a name/version reference."""
+    p = Path(ref)
+    if not p.is_absolute():
+        return None
+    if p.is_file():
+        return p
+    for name in ("conanfile.py", "conanfile.txt"):
+        if (p / name).is_file():
+            return p / name
+    return None
+
+
+def split_refs(raw: str) -> list[str]:
+    """One entry per line. A line is a conanfile path (may contain spaces) or references."""
+    out: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip().strip('"')
+        if not line:
+            continue
+        if conanfile_path(line):
+            out.append(line)
+        else:
+            out += [r for r in re.split(r"[\s,]+", line) if r]
+    return out
+
+
+def load_manifest(path: Path) -> list[tuple[str, str]]:
+    """mirror.json -> [(reference or conanfile path, profile), ...].
+
+    {"profiles": ["p1", "p2"],
+     "packages": ["fmt/11.0.2", "../app/conanfile.py", {"ref": "zlib/1.3.1", "profiles": ["p1"]}]}
+    Relative conanfile paths are relative to the manifest.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConanError(f"Could not read manifest {path}: {e}")
+    default_profiles = data.get("profiles") or []
+    jobs: list[tuple[str, str]] = []
+    for entry in data.get("packages") or []:
+        ref = entry if isinstance(entry, str) else entry.get("ref", "")
+        profiles = default_profiles if isinstance(entry, str) else entry.get("profiles") or default_profiles
+        if not ref:
+            raise ConanError(f"Manifest {path.name}: a package entry has no 'ref'")
+        if not profiles:
+            raise ConanError(f"Manifest {path.name}: no profiles for {ref}")
+        if re.search(r"conanfile\.(py|txt)$", ref) or ref.startswith("."):
+            ref = str((path.parent / ref).resolve())
+        jobs += [(ref, prof) for prof in profiles]
+    if not jobs:
+        raise ConanError(f"Manifest {path.name} lists no packages")
+    return jobs
+
+
+def save_manifest(path: Path, refs: list[str], profiles: list[str]) -> None:
+    packages = []
+    for r in refs:
+        cf = conanfile_path(r)
+        if cf:      # keep paths inside the repo's parent tree relative, so the file is portable
+            try:
+                r = Path(os.path.relpath(cf, path.parent)).as_posix()
+                r = r if r.startswith(".") else "./" + r
+            except ValueError:      # different drive on Windows
+                r = str(cf)
+        packages.append(r)
+    path.write_text(json.dumps({"profiles": profiles, "packages": packages}, indent=2) + "\n",
+                    encoding="utf-8")
+
+
 @dataclass
 class Options:
     build_missing: bool = True
     fetch_sources: bool = True
     skip_existing: bool = True
     dry_run: bool = False
+    verify: bool = True          # afterwards, install from Nexus alone in a clean Conan home
+    verify_sources: bool = True  # ... and check every source archive can be fetched from Nexus
 
 
 @dataclass
@@ -262,6 +340,7 @@ class Mirror:
         self.s = settings
         self._nexus_cache: dict[str, tuple[str, set[str]]] = {}
         self._sources: list[str] | None = None
+        self._verify_env: dict | None = None
 
     def sources(self) -> list[str]:
         """Remotes packages are taken from: our own recipes (if registered), then ConanCenter."""
@@ -269,10 +348,29 @@ class Mirror:
             self._sources = source_remotes(self.c, self.s)
         return self._sources
 
+    @staticmethod
+    def _target(ref: str) -> list[str]:
+        """A reference is installed with --requires; a project's conanfile by its path, so the
+        project's own options, overrides and conan.lock (if next to it) shape the graph."""
+        cf = conanfile_path(ref)
+        return [str(cf)] if cf else ["--requires", ref]
+
+    @staticmethod
+    def _safe(ref: str, profile: str) -> str:
+        cf = conanfile_path(ref)
+        label = f"{cf.parent.name}_{cf.name}" if cf else ref
+        return re.sub(r"[^A-Za-z0-9._-]", "_", f"{label}_{profile}")
+
+    def _out(self, ref: str, profile: str) -> list[str]:
+        # keep generated files out of the project folder when installing a conanfile
+        if conanfile_path(ref):
+            return ["--output-folder", str(WORK_DIR / f"out_{self._safe(ref, profile)}")]
+        return []
+
     def _common(self, ref: str, profile: str, opts: Options) -> list[str]:
         # Build tools (cmake, ninja, ...) use one fixed Release profile when set, so a Debug
         # host profile does not ask for Debug tools that have to be built from source.
-        a = ["--requires", ref, "-pr:h", profile, "-pr:b", self.s.get("build_profile") or profile]
+        a = [*self._target(ref), "-pr:h", profile, "-pr:b", self.s.get("build_profile") or profile]
         for r in self.sources():
             a += ["-r", r]
         # --update: use the newest recipe revision, not a stale copy in the local cache
@@ -319,11 +417,11 @@ class Mirror:
             if rows and all(r.done for r in rows):
                 log(f"== {ref} [{profile}]: everything already in Nexus - skipped", "ok")
                 return "skipped"
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{ref}_{profile}")
+        safe = self._safe(ref, profile)
         graph_file = WORK_DIR / f"graph_{safe}.json"
         list_file = WORK_DIR / f"pkglist_{safe}.json"
 
-        args = ["install", *self._common(ref, profile, opts)]
+        args = ["install", *self._common(ref, profile, opts), *self._out(ref, profile)]
         if opts.fetch_sources:   # make sure sources land in the backup cache
             args += ["-c", "tools.build:download_source=True"]
         graph_file.write_text(self.c.run([*args, "--format=json"]), encoding="utf-8")
@@ -342,6 +440,160 @@ class Mirror:
         self._nexus_cache.clear()
         log(f"== {ref} [{profile}]: {'dry run complete' if opts.dry_run else 'uploaded'}", "ok")
         return "uploaded"
+
+    # ---- verify: can a developer install this from Nexus alone? -----------
+    def _prepare_verify(self, log) -> dict:
+        """A throwaway Conan home built from the team config: only Nexus, no proxy, empty cache."""
+        if self._verify_env is None:
+            home = WORK_DIR / "verify_home"
+            mirror_home = self.c.home()
+            profiles = [p.relative_to(mirror_home / "profiles").as_posix()
+                        for p in sorted((mirror_home / "profiles").rglob("*")) if p.is_file()]
+            try:
+                tc.build(home, self.s, profiles, mirror_home, log=log)
+            except (tc.TeamConfigError, OSError) as e:
+                raise ConanError(f"Could not prepare the verify home: {e}")
+            env = ir.conan_env({**self.s, "proxy": "", "conan_home": str(home)}, *self.c.app.creds)
+            for k in ("CONAN_MIRROR_RAW_USER", "CONAN_MIRROR_RAW_PASSWORD"):
+                env.pop(k, None)    # developers have no raw-repo credentials
+            self._verify_env = env
+            log(f"Verify home: {home} (team config, Nexus only, empty cache)")
+        return self._verify_env
+
+    def verify(self, ref: str, profile: str, opts: Options, log) -> None:
+        """Install from Nexus only. Raises ConanError if a binary or a source is missing."""
+        env = self._prepare_verify(log)
+        args = ["install", *self._target(ref), "-pr:h", profile,
+                "-pr:b", self.s.get("build_profile") or profile,
+                "-r", self.s["nexus_remote"], *self._out(ref, profile)]
+        if opts.verify_sources and self.s.get("raw_url"):
+            # fetch every source archive too, as --build=missing on a developer machine would
+            args += ["-c", "tools.build:download_source=True"]
+        try:
+            self.c.run(args, env=env)
+        except ConanError as e:
+            if "source backup server" in str(e):
+                raise ConanError(
+                    f"{e}\n   The raw repo refused a download without a login. Developers have no "
+                    "raw-repo login, so --build=missing would fail for them the same way. Allow "
+                    "anonymous read on the raw repo, or untick 'Verify sources too' if the team "
+                    "never builds from source.")
+            raise
+        log(f"== {ref} [{profile}]: verified from Nexus", "ok")
+
+
+def run_jobs(m: Mirror, jobs: list[tuple[str, str]], opts: Options, log, on_plan) -> list[tuple[str, str, str]]:
+    """Mirror (and verify) each (ref, profile). Returns [(ref, profile, result)]; never raises ConanError."""
+    results = []
+    for ref, p in jobs:
+        log(f"== Mirror {ref} [{p}]", "cmd")
+        try:
+            res = m.mirror(ref, p, opts, log, lambda rows, r=ref: on_plan(r, rows))
+        except ConanError as e:
+            log(f"{ref} [{p}] FAILED: {e}", "err")
+            results.append((ref, p, "FAILED"))
+            continue
+        if opts.verify and not opts.dry_run and res == "uploaded":
+            try:
+                m.verify(ref, p, opts, log)
+                res = "uploaded + verified"
+            except ConanError as e:
+                log(f"{ref} [{p}] uploaded, but installing it from Nexus alone FAILED: {e}", "err")
+                res = "VERIFY FAILED"
+        results.append((ref, p, res))
+    log("== Summary", "cmd")
+    for ref, p, res in results:
+        log(f"   {res:19} {ref} [{p}]", "err" if "FAILED" in res else "ok")
+    return results
+
+
+def run_verify(m: Mirror, jobs: list[tuple[str, str]], opts: Options, log) -> list[tuple[str, str, str]]:
+    results = []
+    for ref, p in jobs:
+        log(f"== Verify {ref} [{p}]", "cmd")
+        try:
+            m.verify(ref, p, opts, log)
+            results.append((ref, p, "verified"))
+        except ConanError as e:
+            log(f"{ref} [{p}] cannot be installed from Nexus alone: {e}", "err")
+            results.append((ref, p, "VERIFY FAILED"))
+    log("== Summary", "cmd")
+    for ref, p, res in results:
+        log(f"   {res:14} {ref} [{p}]", "err" if "FAILED" in res else "ok")
+    return results
+
+
+# --------------------------------------------------------------------------- conan home setup
+def apply_config(conan: Conan, s: dict, log) -> None:
+    """Set up the mirror's Conan home: remotes, global.conf, source credentials, MSVC fallbacks."""
+    remotes = {r["name"]: r for r in conan.json(["remote", "list"], quiet=True)}
+    for name, url in ((s["center_remote"], s["center_url"]), (s["nexus_remote"], s["nexus_url"])):
+        if not url:
+            continue
+        if name not in remotes:
+            conan.run(["remote", "add", name, url])
+        elif remotes[name]["url"].rstrip("/") != url.rstrip("/"):
+            conan.run(["remote", "update", name, "--url", url])
+        else:
+            log(f"Remote '{name}' already set to {url}")
+        if name in remotes and not remotes[name].get("enabled", True):
+            conan.run(["remote", "enable", name])
+
+    if s["internal_remote"] and ir.list_packages():
+        ir.ensure_remote(lambda a: conan.run(a, quiet=True), s["internal_remote"], log=log)
+
+    home = conan.home()
+    lines = []
+    if s["raw_url"]:
+        # list values are Python literals; plain string values must NOT be quoted
+        lines += [f"core.sources:download_urls = {json.dumps(['origin', s['raw_url']])}",
+                  f"core.sources:upload_url = {s['raw_url']}"]
+    if s["cacert_path"]:
+        lines.append(f"core.net.http:cacert_path = {s['cacert_path']}")
+    write_managed_block(home / "global.conf", lines, log)
+
+    creds = home / "source_credentials.json"
+    if s["raw_url"]:
+        if creds.exists() and "CONAN_MIRROR_RAW" not in creds.read_text(encoding="utf-8"):
+            backup = creds.with_suffix(".json.bak")
+            shutil.copy2(creds, backup)
+            log(f"Backed up existing {creds.name} to {backup.name}")
+        creds.write_text(
+            '{% set u = os.getenv("CONAN_MIRROR_RAW_USER", "") %}'
+            '{% set p = os.getenv("CONAN_MIRROR_RAW_PASSWORD", "") %}\n'
+            + json.dumps({"credentials": [{"url": s["raw_url"], "user": "@@U@@", "password": "@@P@@"}]},
+                         indent=2).replace('"@@U@@"', "{{ u|tojson }}").replace('"@@P@@"', "{{ p|tojson }}")
+            + "\n", encoding="utf-8")
+        log(f"Wrote {creds}", "ok")
+
+    # the same MSVC fallbacks the team config ships, so Plan judges binaries as developers will
+    compat = tc.patched_compat(home, s.get("msvc_fallbacks", tc.DEFAULT_FALLBACKS))
+    if compat is not None:
+        (home / tc.COMPAT).write_text(compat, encoding="utf-8")
+        log("Compatibility plugin: MSVC fallbacks "
+                 + ", ".join(f"{a}->{b}" for a, b in s.get("msvc_fallbacks", tc.DEFAULT_FALLBACKS).items()))
+    elif s.get("msvc_fallbacks", tc.DEFAULT_FALLBACKS):
+        log("WARNING: could not add the MSVC fallbacks to the compatibility plugin "
+                 "(unexpected layout in this Conan version)", "err")
+    conan.run(["remote", "list"])
+
+
+def write_managed_block(path: Path, lines: list[str], log) -> None:
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    bak = path.with_suffix(path.suffix + ".bak")
+    if path.exists() and not bak.exists():
+        shutil.copy2(path, bak)
+        log(f"Backed up {path.name} to {bak.name}")
+    block_re = re.compile(re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END) + r"\n?", re.S)
+    text = block_re.sub("", text).rstrip("\n")
+    for key in {ln.split("=")[0].strip() for ln in lines}:
+        if re.search(rf"^\s*{re.escape(key)}\s*=", text, re.M):
+            log(f"WARNING: {path.name} already sets {key} outside the managed block "
+                     f"- the managed value (later in the file) wins", "err")
+    if lines:
+        text = (text + "\n\n" if text else "") + "\n".join([BLOCK_START, *lines, BLOCK_END])
+    path.write_text(text + "\n", encoding="utf-8")
+    log(f"Updated {path}", "ok")
 
 
 # --------------------------------------------------------------------------- profile templates
@@ -634,9 +886,15 @@ class App(tk.Tk):
         # mirror panel
         right = ttk.LabelFrame(body, text="Mirror", padding=6)
         body.add(right, weight=1)
-        ttk.Label(right, text="Reference(s) - one per line:").pack(anchor="w")
-        self.refs_text = tk.Text(right, height=4, width=28)
+        ttk.Label(right, text="References or conanfiles - one per line:").pack(anchor="w")
+        self.refs_text = tk.Text(right, height=5, width=28, wrap="none")
         self.refs_text.pack(fill="x")
+        rf = ttk.Frame(right)
+        rf.pack(fill="x", pady=(2, 0))
+        for txt, cmd in (("Add conanfile...", self.on_add_conanfile),
+                         ("Load manifest", self.on_manifest_load),
+                         ("Save manifest", self.on_manifest_save)):
+            ttk.Button(rf, text=txt, command=cmd).pack(side="left", expand=True, fill="x")
         ttk.Label(right, text="Profiles (multi-select):").pack(anchor="w", pady=(6, 0))
         lf = ttk.Frame(right)
         lf.pack(fill="both", expand=True)
@@ -651,24 +909,77 @@ class App(tk.Tk):
             "fetch_sources": tk.BooleanVar(value=True),
             "skip_existing": tk.BooleanVar(value=True),
             "dry_run": tk.BooleanVar(value=False),
+            "verify": tk.BooleanVar(value=True),
+            "verify_sources": tk.BooleanVar(value=True),
         }
         for k, txt in (("build_missing", "Build missing binaries from source"),
                        ("fetch_sources", "Fetch sources (upload to raw repo)"),
                        ("skip_existing", "Skip if already complete in Nexus"),
-                       ("dry_run", "Dry run (don't actually upload)")):
+                       ("dry_run", "Dry run (don't actually upload)"),
+                       ("verify", "Verify afterwards (install from Nexus only)"),
+                       ("verify_sources", "Verify sources too (raw repo, no login)")):
             ttk.Checkbutton(right, text=txt, variable=self.opt[k]).pack(anchor="w")
         bf = ttk.Frame(right)
         bf.pack(fill="x", pady=(6, 0))
         ttk.Button(bf, text="Plan", command=self.on_plan).pack(side="left", expand=True, fill="x")
         ttk.Button(bf, text="Mirror to Nexus", command=self.on_mirror).pack(side="left", expand=True,
                                                                              fill="x", padx=(4, 0))
+        ttk.Button(right, text="Verify only (install from Nexus)", command=self.on_verify).pack(
+            fill="x", pady=(4, 0))
 
     def options(self) -> Options:
         return Options(**{k: v.get() for k, v in self.opt.items()})
 
     def selected_refs(self) -> list[str]:
-        raw = self.refs_text.get("1.0", "end")
-        return [r.strip() for r in re.split(r"[\s,]+", raw) if r.strip()]
+        return split_refs(self.refs_text.get("1.0", "end"))
+
+    def _set_refs(self, refs: list[str]):
+        self.refs_text.delete("1.0", "end")
+        self.refs_text.insert("1.0", "\n".join(refs))
+
+    def on_add_conanfile(self):
+        f = filedialog.askopenfilename(title="Project conanfile", filetypes=[
+            ("conanfile", "conanfile.py conanfile.txt"), ("All files", "*")])
+        if f and f not in self.selected_refs():
+            self._set_refs(self.selected_refs() + [str(Path(f))])
+
+    def on_manifest_load(self):
+        f = filedialog.askopenfilename(title="Load manifest", initialdir=str(HERE),
+                                       initialfile=MANIFEST_FILE.name, filetypes=[("JSON", "*.json")])
+        if not f:
+            return
+        try:
+            jobs = load_manifest(Path(f))
+        except ConanError as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+        refs = list(dict.fromkeys(r for r, _ in jobs))
+        profs = set(p for _, p in jobs)
+        self._set_refs(refs)
+        self.prof_list.selection_clear(0, "end")
+        for i, name in enumerate(self.profiles):
+            if name in profs:
+                self.prof_list.selection_set(i)
+        missing = sorted(profs - set(self.profiles))
+        self.log(f"Loaded {len(refs)} package(s) x {len(profs)} profile(s) from {f}", "ok")
+        if missing:
+            self.log(f"WARNING: profiles in the manifest that do not exist here: {', '.join(missing)}", "err")
+        if len(jobs) != len(refs) * len(profs):
+            self.log("NOTE: this manifest gives some packages their own profile list; the GUI mirrors "
+                     "every listed package with every selected profile. Use --manifest on the command "
+                     "line to follow it exactly.")
+
+    def on_manifest_save(self):
+        refs, profs = self.selected_refs(), self.selected_profiles()
+        if not refs or not profs:
+            messagebox.showwarning(APP_NAME, "Enter at least one package and select at least one profile.")
+            return
+        f = filedialog.asksaveasfilename(title="Save manifest", initialdir=str(HERE),
+                                         initialfile=MANIFEST_FILE.name, defaultextension=".json",
+                                         filetypes=[("JSON", "*.json")])
+        if f:
+            save_manifest(Path(f), refs, profs)
+            self.log(f"Manifest written to {f} - commit it so the mirror can be repeated", "ok")
 
     def selected_profiles(self) -> list[str]:
         return [self.prof_list.get(i) for i in self.prof_list.curselection()]
@@ -812,7 +1123,7 @@ class App(tk.Tk):
         refs, profs = ready
         n = len(refs) * len(profs)
         if not opts.dry_run and not messagebox.askyesno(
-                APP_NAME, f"Mirror {len(refs)} reference(s) x {len(profs)} profile(s) "
+                APP_NAME, f"Mirror {len(refs)} package(s) x {len(profs)} profile(s) "
                           f"({n} job(s)) to '{self.settings['nexus_remote']}'?"):
             return
         self.plan_tree.delete(*self.plan_tree.get_children())
@@ -821,21 +1132,23 @@ class App(tk.Tk):
 
     def _task_mirror(self, refs, profs, opts):
         m = Mirror(self.conan, self.settings)
-        results = []
-        for ref in refs:
-            for p in profs:
-                self.log(f"== Mirror {ref} [{p}]", "cmd")
-                try:
-                    results.append((ref, p, m.mirror(ref, p, opts, self.log,
-                                                     lambda rows, r=ref: self.ui(self._add_plan_rows, r, rows))))
-                except ConanError as e:
-                    self.log(f"{ref} [{p}] FAILED: {e}", "err")
-                    results.append((ref, p, "FAILED"))
-        self.log("== Summary", "cmd")
-        for ref, p, res in results:
-            self.log(f"   {res:9} {ref} [{p}]", "err" if res == "FAILED" else "ok")
-        if any(r[2] == "FAILED" for r in results):
+        results = run_jobs(m, [(r, p) for r in refs for p in profs], opts, self.log,
+                           lambda r, rows: self.ui(self._add_plan_rows, r, rows))
+        if any("FAILED" in r[2] for r in results):
             raise ConanError("some jobs failed - see the log")
+
+    def on_verify(self):
+        ready = self._check_ready()
+        if not ready:
+            return
+        refs, profs = ready
+        self.run_task("Verifying", self._task_verify, refs, profs, self.options())
+
+    def _task_verify(self, refs, profs, opts):
+        m = Mirror(self.conan, self.settings)
+        results = run_verify(m, [(r, p) for r in refs for p in profs], opts, self.log)
+        if any("FAILED" in r[2] for r in results):
+            raise ConanError("some packages cannot be installed from Nexus alone - see the log")
 
     # ---- Plan tab ---------------------------------------------------------
     def _build_plan_tab(self):
@@ -937,7 +1250,8 @@ class App(tk.Tk):
 
     def on_internal_browse(self):
         f = filedialog.askopenfilename(title="Source archive", filetypes=[
-            ("Archives", "*.zip *.tar.gz *.tgz *.tar.bz2 *.tar.xz *.tar"), ("All files", "*.*")])
+            # single extensions only: file dialogs don't match double ones like *.tar.gz
+            ("Archives", "*.zip *.gz *.tgz *.bz2 *.xz *.tar"), ("All files", "*")])
         if f:
             self.ivars["archive"].set(f)
 
@@ -1044,6 +1358,7 @@ class App(tk.Tk):
         for txt, cmd in (("Refresh", lambda: self.run_task("Loading profiles", self._task_load_profiles)),
                          ("New from template...", self.on_profile_wizard),
                          ("Detect from this machine...", self.on_profile_detect),
+                         ("Import from my normal Conan home", self.on_profile_import),
                          ("Duplicate...", self.on_profile_duplicate),
                          ("Delete", self.on_profile_delete),
                          ("Open profiles folder", self.on_profile_folder)):
@@ -1068,6 +1383,13 @@ class App(tk.Tk):
         self.conan.home()
         profs = self.conan.json(["profile", "list"], quiet=True)
         self.log(f"Conan home: {self.conan.home()}  ({len(profs)} profiles)")
+        s = self.settings
+        if s["nexus_url"] and s["nexus_remote"] not in {r["name"] for r in self.conan.json(["remote", "list"], quiet=True)}:
+            self.log(f"This Conan home has no '{s['nexus_remote']}' remote yet - press 'Apply to Conan' "
+                     "on the Settings tab.", "err")
+        if not profs:
+            self.log("No profiles here yet. On the Profiles tab: 'New from template', or 'Import from "
+                     "my normal Conan home' to copy the ones you already have.")
         self.ui(self._fill_profiles, sorted(profs, key=natural_key))
 
     def _fill_profiles(self, profs: list[str]):
@@ -1119,6 +1441,22 @@ class App(tk.Tk):
             self.log(f"Created profile {name}", "ok")
         self.run_task("Loading profiles", self._task_load_profiles)
 
+    def on_profile_import(self):
+        """Copy profiles from the Conan home you use outside this tool."""
+        normal = Path(os.environ.get("CONAN_HOME") or Path.home() / ".conan2")
+        src = normal / "profiles"
+        if normal.resolve() == self.conan.home().resolve():
+            messagebox.showinfo(APP_NAME, "The mirror is using your normal Conan home - nothing to import.")
+            return
+        found = {p.relative_to(src).as_posix(): p for p in sorted(src.rglob("*")) if p.is_file()} \
+            if src.is_dir() else {}
+        found.pop("default", None)      # machine-detected; make one here with 'Detect' if needed
+        if not found:
+            messagebox.showinfo(APP_NAME, f"No profiles found in {src}.")
+            return
+        if messagebox.askyesno(APP_NAME, f"Copy {len(found)} profile(s) from {src}?\n\n" + "\n".join(found)):
+            self._write_profiles({n: p.read_text(encoding="utf-8") for n, p in found.items()})
+
     def on_profile_wizard(self):
         ProfileWizard(self, self._write_profiles)
 
@@ -1166,6 +1504,8 @@ class App(tk.Tk):
             ("cacert_path", "CA bundle (optional)", "only if the proxy intercepts TLS"),
             ("nexus_user", "Nexus username", "password is asked per session, never saved"),
             ("internal_remote", "Internal recipes remote name", "points at ./recipes next to this script"),
+            ("conan_home", "Conan home for mirroring", "kept apart from your everyday Conan; "
+                                                       "empty = use your normal one"),
             ("build_profile", "Build profile (for tools)", "a Release profile, e.g. win-msvc194-cpp20-release; "
                                                            "empty = same as each host profile"),
         ]
@@ -1197,8 +1537,9 @@ class App(tk.Tk):
             "global.conf (backup-sources upload/download URLs, optional CA bundle) plus a "
             "source_credentials.json that reads your session credentials from environment variables. "
             "A .bak copy of each file is kept the first time.\n\n"
-            "'Export team config' creates a zip with team_setup.py, the Nexus settings and your profiles. "
-            "Developers unzip it and run:  python team_setup.py apply   (and 'revert' to undo).")
+            "'Export team config' creates a zip in Conan's own config format (Nexus remote, source "
+            "location, MSVC fallbacks, your profiles) and can upload it to the Nexus raw repo. "
+            "Developers install or update it with one command:  conan config install <zip or URL>")
         ).grid(row=r + 2, column=0, columnspan=3, sticky="w", pady=10)
 
     def on_settings_save(self) -> bool:
@@ -1209,9 +1550,14 @@ class App(tk.Tk):
         if len({new["nexus_remote"], new["center_remote"], new["internal_remote"]}) < 3:
             messagebox.showerror(APP_NAME, "Nexus, ConanCenter and internal remote names must differ.")
             return False
+        home_changed = new["conan_home"] != self.settings.get("conan_home")
         self.settings.update(new)
         save_settings(self.settings)
         self.log(f"Settings saved to {SETTINGS_FILE}", "ok")
+        if home_changed:
+            self.conan._home = None
+            self.log("Conan home changed - press 'Apply to Conan', then check the Profiles tab.", "err")
+            self.after(200, lambda: self.run_task("Loading profiles", self._task_load_profiles))
         return True
 
     def on_apply_conan(self):
@@ -1219,64 +1565,7 @@ class App(tk.Tk):
             self.run_task("Applying Conan config", self._task_apply)
 
     def _task_apply(self):
-        s = self.settings
-        remotes = {r["name"]: r for r in self.conan.json(["remote", "list"], quiet=True)}
-        for name, url in ((s["center_remote"], s["center_url"]), (s["nexus_remote"], s["nexus_url"])):
-            if not url:
-                continue
-            if name not in remotes:
-                self.conan.run(["remote", "add", name, url])
-            elif remotes[name]["url"].rstrip("/") != url.rstrip("/"):
-                self.conan.run(["remote", "update", name, "--url", url])
-            else:
-                self.log(f"Remote '{name}' already set to {url}")
-            if name in remotes and not remotes[name].get("enabled", True):
-                self.conan.run(["remote", "enable", name])
-
-        if s["internal_remote"] and ir.list_packages():
-            ir.ensure_remote(lambda a: self.conan.run(a, quiet=True), s["internal_remote"], log=self.log)
-
-        home = self.conan.home()
-        lines = []
-        if s["raw_url"]:
-            # list values are Python literals; plain string values must NOT be quoted
-            lines += [f"core.sources:download_urls = {json.dumps(['origin', s['raw_url']])}",
-                      f"core.sources:upload_url = {s['raw_url']}"]
-        if s["cacert_path"]:
-            lines.append(f"core.net.http:cacert_path = {s['cacert_path']}")
-        self._write_managed_block(home / "global.conf", lines)
-
-        creds = home / "source_credentials.json"
-        if s["raw_url"]:
-            if creds.exists() and "CONAN_MIRROR_RAW" not in creds.read_text(encoding="utf-8"):
-                backup = creds.with_suffix(".json.bak")
-                shutil.copy2(creds, backup)
-                self.log(f"Backed up existing {creds.name} to {backup.name}")
-            creds.write_text(
-                '{% set u = os.getenv("CONAN_MIRROR_RAW_USER", "") %}'
-                '{% set p = os.getenv("CONAN_MIRROR_RAW_PASSWORD", "") %}\n'
-                + json.dumps({"credentials": [{"url": s["raw_url"], "user": "@@U@@", "password": "@@P@@"}]},
-                             indent=2).replace('"@@U@@"', "{{ u|tojson }}").replace('"@@P@@"', "{{ p|tojson }}")
-                + "\n", encoding="utf-8")
-            self.log(f"Wrote {creds}", "ok")
-        self.conan.run(["remote", "list"])
-
-    def _write_managed_block(self, path: Path, lines: list[str]):
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
-        bak = path.with_suffix(path.suffix + ".bak")
-        if path.exists() and not bak.exists():
-            shutil.copy2(path, bak)
-            self.log(f"Backed up {path.name} to {bak.name}")
-        block_re = re.compile(re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END) + r"\n?", re.S)
-        text = block_re.sub("", text).rstrip("\n")
-        for key in {ln.split("=")[0].strip() for ln in lines}:
-            if re.search(rf"^\s*{re.escape(key)}\s*=", text, re.M):
-                self.log(f"WARNING: {path.name} already sets {key} outside the managed block "
-                         f"- the managed value (later in the file) wins", "err")
-        if lines:
-            text = (text + "\n\n" if text else "") + "\n".join([BLOCK_START, *lines, BLOCK_END])
-        path.write_text(text + "\n", encoding="utf-8")
-        self.log(f"Updated {path}", "ok")
+        apply_config(self.conan, self.settings, self.log)
 
     def ask_creds(self) -> bool:
         user = simpledialog.askstring(APP_NAME, "Nexus username:", parent=self,
@@ -1350,61 +1639,97 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, f"Include {len(profs)} profile(s)?\n\n" + "\n".join(profs)
                                    + "\n\n(Select profiles on the Search tab to limit this.)"):
             return
-        setup_script = HERE / "team_setup.py"
-        if not setup_script.exists():
-            messagebox.showerror(APP_NAME, f"{setup_script} not found (keep it next to this script).")
-            return
-        team_cfg = {
-            "nexus_remote": s["nexus_remote"],
-            "nexus_url": s["nexus_url"],
-            "raw_url": s["raw_url"],
-            "disable_remotes": [s["center_remote"]],
-            "msvc_fallbacks": {"195": "194", "194": "193"},
-        }
-        install_profiles = f"-pr:h <profile> -pr:b {bp}" if bp else "-pr:a <profile>"
-        build_profile_note = (f"""
-Always pass  -pr:b {bp}  as shown: packages in Nexus were built with that
-build profile, and a different one can make Conan rebuild tools from source.
-""" if bp else "")
-        readme = f"""Team Conan configuration
-========================
+        url = ""
+        if s["raw_url"] and messagebox.askyesno(
+                APP_NAME, "Also upload it to the Nexus raw repo, so developers can install it by URL?\n\n"
+                          f"{s['raw_url']}{tc.CONFIG_PATH_IN_RAW}\n\n"
+                          "(An existing team config there is replaced. Developers can only fetch it "
+                          "if the raw repo allows anonymous read.)"):
+            if not self.creds[0] and not self.ask_creds():
+                return
+            url = s["raw_url"] + tc.CONFIG_PATH_IN_RAW
 
-Requires Python 3.11+ and Conan 2 (pip install conan). Unzip anywhere, then:
+        def task():
+            try:
+                version = self.conan.run(["--version"], quiet=True).strip().split()[-1]
+                folder = tc.build(WORK_DIR / "team_config", s, profs, self.conan.home(), version, url, self.log)
+                tc.make_zip(folder, Path(dest))
+                self.log(f"Team config written to {dest}", "ok")
+                if url:
+                    ir.NexusRaw(self.creds[0], self.creds[1], s["cacert_path"]).put(url, Path(dest))
+                    self.log(f"Uploaded to {url}", "ok")
+            except (tc.TeamConfigError, ir.RecipeError, OSError) as e:
+                raise ConanError(str(e))
+            self.log(f"Developers run:  conan config install {url or Path(dest).name}", "ok")
+            self.log(f"          then:  conan remote login {s['nexus_remote']} <username>")
 
-    python team_setup.py apply     configure Conan for Nexus (asks to log in)
-    python team_setup.py status    show what is configured
-    python team_setup.py revert    undo everything, exactly as it was before
-
-What 'apply' does (all backed up first, in %APPDATA%\\ConanTeamSetup):
-  - adds the '{s['nexus_remote']}' remote ({s['nexus_url']}) and disables '{s['center_remote']}'
-  - lets --build=missing download upstream sources from Nexus instead of the internet
-  - lets MSVC 195 use 194 binaries (and 194 use 193)
-  - installs the team profiles: {', '.join(profs) or '(none)'}
-
-Then use Conan as normal, e.g.:
-
-    conan install . {install_profiles} --build=missing
-{build_profile_note}
-If a package is missing from Nexus, ask the Conan admin to mirror it
-(name/version + which profile you are using).
-"""
-        try:
-            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
-                z.write(setup_script, "team_setup.py")
-                z.writestr("team_config.json", json.dumps(team_cfg, indent=2))
-                z.writestr("README.txt", readme)
-                for p in profs:
-                    z.write(self.profiles_dir() / p, f"profiles/{p}")
-        except OSError as e:
-            messagebox.showerror(APP_NAME, f"Could not write zip: {e}")
-            return
-        self.log(f"Team config written to {dest}", "ok")
+        self.run_task("Exporting team config", task)
 
 
-def main():
-    app = App()
-    app.mainloop()
+# --------------------------------------------------------------------------- headless
+class Headless:
+    """Stands in for the GUI when running from a manifest on the command line."""
+
+    def __init__(self, user: str, password: str):
+        self.settings = load_settings()
+        self.creds = (user, password)
+
+    @staticmethod
+    def log(text: str, tag: str = "") -> None:
+        print(text, flush=True)
+
+
+def run_headless(a) -> int:
+    user = a.user or os.environ.get("CONAN_MIRROR_RAW_USER", "")
+    password = os.environ.get("CONAN_MIRROR_RAW_PASSWORD", "")
+    app = Headless(user, password)
+    s = app.settings
+    if not s["nexus_url"]:
+        print("ERROR: no Nexus URL in settings - run the GUI once and fill in Settings.", file=sys.stderr)
+        return 2
+    if not a.plan and not user:
+        app.creds = (s.get("nexus_user") or input("Nexus username: ").strip(), "")
+    if not a.plan and not password:
+        app.creds = (app.creds[0], getpass.getpass(f"Nexus password / token for {app.creds[0]}: "))
+    conan = Conan(app)  # type: ignore[arg-type]
+    m = Mirror(conan, s)
+    opts = Options(dry_run=a.dry_run, verify=not a.no_verify)
+    try:
+        jobs = load_manifest(Path(a.manifest).resolve())
+        apply_config(conan, s, lambda text, tag="": None)     # idempotent; quiet
+        if a.plan:
+            todo = 0
+            for ref, p in jobs:
+                print(f"== Plan {ref} [{p}]", flush=True)
+                for r in m.plan(ref, p, opts):
+                    print(f"   {r.ref:45} {r.context:6} {r.action}")
+                    todo += not r.done
+            print(f"\n{todo} package(s) not yet complete in Nexus")
+            return 0
+        if a.verify_only:
+            results = run_verify(m, jobs, opts, app.log)
+        else:
+            results = run_jobs(m, jobs, opts, app.log, lambda r, rows: None)
+    except ConanError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    return 1 if any("FAILED" in r[2] for r in results) else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Conan Mirror. Without --manifest the GUI opens.")
+    ap.add_argument("--manifest", metavar="FILE", help="mirror everything listed in this file, no GUI")
+    ap.add_argument("--plan", action="store_true", help="with --manifest: only show what would be done")
+    ap.add_argument("--dry-run", action="store_true", help="with --manifest: do everything except upload")
+    ap.add_argument("--no-verify", action="store_true", help="with --manifest: skip the install-from-Nexus check")
+    ap.add_argument("--verify-only", action="store_true", help="with --manifest: only run that check")
+    ap.add_argument("--user", default="", help="Nexus username (password: CONAN_MIRROR_RAW_PASSWORD or prompt)")
+    a = ap.parse_args()
+    if a.manifest:
+        return run_headless(a)
+    App().mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

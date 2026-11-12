@@ -44,6 +44,8 @@ from urllib.parse import quote, urlparse
 HERE = Path(__file__).resolve().parent
 INDEX_ROOT = HERE                       # the local-recipes-index remote points here
 SETTINGS_FILE = Path.home() / ".conan_mirror" / "settings.json"
+# The mirror works in its own Conan home, apart from the admin's everyday one.
+DEFAULT_CONAN_HOME = Path.home() / ".conan_mirror" / "conan_home"
 NAME_RE = re.compile(r"[a-z0-9_][a-z0-9_+.-]{1,100}")
 VERSION_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_+.-]{0,50}")
 TEMPLATES = ("cmake", "header-only")
@@ -58,6 +60,9 @@ def conan_env(settings: dict, user: str = "", password: str = "") -> dict:
     """Environment for running conan: proxy for ConanCenter only, Nexus credentials."""
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
+    home = settings.get("conan_home", str(DEFAULT_CONAN_HOME))
+    if home:        # empty = use Conan's normal home
+        env["CONAN_HOME"] = home
     proxy = (settings.get("proxy") or "").strip()
     if proxy:
         if "://" not in proxy:
@@ -432,7 +437,8 @@ def _cli_runner(settings: dict, creds: tuple[str, str]):
     def run(args: list[str]) -> str:
         exe = shutil.which(settings.get("conan_exe") or "conan")
         if not exe:
-            raise RecipeError("'conan' not found on PATH. Install it with:  pip install conan")
+            raise RecipeError("'conan' not found on PATH. Add your Conan 2 folder to PATH, or set the "
+                              "Conan executable in the GUI's Settings.")
         p = subprocess.run([exe, *args], text=True, stdout=subprocess.PIPE,
                            env=conan_env(settings, *creds))
         if p.returncode != 0:
