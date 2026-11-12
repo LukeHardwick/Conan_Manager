@@ -1,0 +1,7 @@
+sources:
+  # 3.3.3a originally from: CIGI SourceForge project, "CIGI Class Library (CCL)" / "CCL Version 3.3.3"
+  # The URL below is a placeholder until "Create draft / add version" is run with the archive:
+  # that uploads the file to our Nexus raw repo and writes the real URL here.
+  "3.3.3a":
+    url: "https://nexus.example.com/repository/conan-sources/upstream/cigi-ccl/3.3.3a/ccl_3_3_3a.tar.gz"
+    sha256: "a1f87921e14ee707ae251cd70ffee5a749653f86067ad2f0f8310f5ad2c21f42"

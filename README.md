@@ -8,6 +8,8 @@ your team only ever talks to Nexus.
 |---|---|
 | `conan_mirror.py` | The GUI. Run `python conan_mirror.py` |
 | `check_network.py` | Proxy / Nexus / TLS-interception check (also run from the GUI) |
+| `internal_recipes.py` | Draft and test recipes for packages that aren't on ConanCenter (also the GUI's *Internal packages* tab) |
+| `recipes/` | Our own recipes, created by the above |
 
 Requires Conan 2 on PATH (`pip install conan`). On Windows, tkinter ships with the
 python.org installer. On macOS with Homebrew Python: `brew install python-tk`.
@@ -33,6 +35,10 @@ ConanCenter ──(proxy)──► your machine ──(direct)──► Nexus co
    (from GitHub etc.) to the raw repo during `conan upload`. Files already in the raw repo
    are skipped. The team's config points `core.sources:download_urls` at the raw repo, so
    `--build=missing` works for them without internet access.
+5. **Internal packages** tab: for libraries that aren't on ConanCenter. You supply the source
+   archive, the tool stores it in the raw repo and drafts a recipe in `recipes/`. Search, Plan
+   and Mirror then treat those recipes as a second source next to ConanCenter, and always use
+   the newest recipe revision (`--update`).
 
 ## First-time setup (admin, on the Windows machine)
 
@@ -72,8 +78,8 @@ again is safe because the original backup is kept.
 
 ## Further docs
 
-- [docs/INTERNAL_RECIPES.md](docs/INTERNAL_RECIPES.md): packages that aren't on ConanCenter
-  (e.g. the CIGI 3.3 class library), via a `local-recipes-index` remote
+- [docs/INTERNAL_RECIPES.md](docs/INTERNAL_RECIPES.md): step-by-step guide to adding a package
+  that isn't on ConanCenter (e.g. the CIGI 3.3 class library) from the *Internal packages* tab
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): known bugs and their suggested fixes
 
 ## Notes

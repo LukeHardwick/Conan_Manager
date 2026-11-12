@@ -24,16 +24,16 @@ what goes wrong and the suggested fix.
 ## Issues, most severe first
 
 ### 1. The app can freeze permanently after a UI error
-`conan_mirror.py:478` (`App._drain`). If any queued UI callback raises, the exception escapes
+`conan_mirror.py:475` (`App._drain`). If any queued UI callback raises, the exception escapes
 `_drain` before `self.after(80, self._drain)` runs, so the queue is never drained again. The
 app stays "busy", logs stop and every button reports "Another task is running".
 
 **Fix:** wrap each queued call in `try/except` (log the error) and reschedule in a `finally`.
 
 ### 2. "Show effective profile" shows nothing
-`conan_mirror.py:925`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
+`conan_mirror.py:1094`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
 stderr and returns stdout, which this caller ignores. The same applies to the `conan remote list`
-at the end of *Apply to Conan* (`conan_mirror.py:1073`).
+at the end of *Apply to Conan* (`conan_mirror.py:1246`).
 
 **Fix:** log the returned stdout for these two calls (or add a `log_stdout=True` option to `run`).
 
@@ -46,7 +46,7 @@ from source downloads sources regardless of that checkbox. The upload then fails
 **Fix:** prompt whenever `raw_url` is set and this is not a dry run.
 
 ### 4. Debug profiles are also used for build tools
-`conan_mirror.py:280` passes the same profile as `-pr:h` and `-pr:b`. With a Debug profile,
+`conan_mirror.py:272` passes the same profile as `-pr:h` and `-pr:b`. With a Debug profile,
 tool requirements are resolved as Debug too. Tools whose package ignores the build type are
 unaffected (cmake still downloads), but others (ninja, pkgconf, nasm) have no Debug binaries
 on ConanCenter and get built from source. The README's `-pr:a <profile>` advice to the
@@ -56,13 +56,13 @@ team does the same.
 to use `-pr:h <profile> -pr:b <release profile>`.
 
 ### 5. Cancel leaves builds running on macOS/Linux
-`conan_mirror.py:217`. `p.terminate()` only stops the `conan` process; cmake and compiler
+`conan_mirror.py:195`. `p.terminate()` only stops the `conan` process; cmake and compiler
 children keep running. (Windows is fine: it uses `taskkill /T`.)
 
 **Fix:** start Conan with `start_new_session=True` and cancel with `os.killpg(p.pid, SIGTERM)`.
 
 ### 6. Apply replaces the whole `source_credentials.json`
-`conan_mirror.py:1066`. A `.bak` is kept, but credentials for any other URLs in the file stop
+`conan_mirror.py:1239`. A `.bak` is kept, but credentials for any other URLs in the file stop
 working.
 
 **Fix:** merge our entry into the existing `credentials` list instead of overwriting the file.
@@ -74,7 +74,7 @@ still calls `input()`.
 **Fix:** with `--yes` and no `--user`, fall back to `getpass.getuser()` without prompting.
 
 ### 8. Profile wizard writes incomplete profiles for some compilers
-`conan_mirror.py:358` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
+`conan_mirror.py:355` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
 for apple-clang. gcc on Windows (MinGW) gets none, and C++ packages are then invalid for that
 profile ("'settings.compiler.libcxx' value not defined"). Clang on Windows or macOS also gets
 none; Conan accepts that, but on macOS the standard library is then missing from the profile.

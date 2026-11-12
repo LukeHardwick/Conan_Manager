@@ -33,11 +33,12 @@ import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
+
+import internal_recipes as ir
 
 APP_NAME = "Conan Mirror"
 HERE = Path(__file__).resolve().parent
@@ -58,6 +59,7 @@ DEFAULTS = {
     "proxy": "",              # e.g. 10.1.2.3:8080  (used for ConanCenter only)
     "cacert_path": "",        # optional CA bundle if the proxy intercepts TLS
     "nexus_user": "",
+    "internal_remote": "internal",   # local-recipes-index remote for ./recipes
 }
 
 
@@ -127,31 +129,7 @@ class Conan:
         self._home: Path | None = None
 
     def env(self) -> dict:
-        s = self.app.settings
-        env = dict(os.environ)
-        env["NO_COLOR"] = "1"
-        proxy = s["proxy"].strip()
-        if proxy:
-            if "://" not in proxy:
-                proxy = "http://" + proxy
-            for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-                env[k] = proxy
-            # Nexus is reachable directly - keep it off the proxy.
-            hosts = ["localhost", "127.0.0.1"]
-            for u in (s["nexus_url"], s["raw_url"]):
-                h = urlparse(u).hostname
-                if h and h not in hosts:
-                    hosts.append(h)
-            existing = env.get("NO_PROXY") or env.get("no_proxy") or ""
-            env["NO_PROXY"] = env["no_proxy"] = ",".join(filter(None, [existing, *hosts]))
-        user, pw = self.app.creds
-        if user:
-            sfx = env_suffix(s["nexus_remote"])
-            env[f"CONAN_LOGIN_USERNAME_{sfx}"] = user
-            env[f"CONAN_PASSWORD_{sfx}"] = pw
-            env["CONAN_MIRROR_RAW_USER"] = user        # read by source_credentials.json
-            env["CONAN_MIRROR_RAW_PASSWORD"] = pw
-        return env
+        return ir.conan_env(self.app.settings, *self.app.creds)
 
     def run(self, args: list[str], check: bool = True, quiet: bool = False) -> str:
         if self.cancelled:
@@ -234,6 +212,12 @@ class Conan:
 
 
 # --------------------------------------------------------------------------- mirror logic
+def source_remotes(conan: Conan, s: dict) -> list[str]:
+    internal = s.get("internal_remote", "")
+    enabled = {r["name"] for r in conan.json(["remote", "list"], quiet=True) if r.get("enabled", True)}
+    return ([internal] if internal and internal in enabled else []) + [s["center_remote"]]
+
+
 @dataclass
 class Options:
     build_missing: bool = True
@@ -263,6 +247,7 @@ class PlanRow:
         return {
             "Download": "download + upload",
             "Cache": "upload (in local cache)",
+            "Update": "download newer + upload",
             "Build": "BUILD from source + upload",
             "Missing": "MISSING - enable 'build missing'",
             "Invalid": "INVALID for this profile",
@@ -275,10 +260,21 @@ class Mirror:
         self.c = conan
         self.s = settings
         self._nexus_cache: dict[str, tuple[str, set[str]]] = {}
+        self._sources: list[str] | None = None
+
+    def sources(self) -> list[str]:
+        """Remotes packages are taken from: our own recipes (if registered), then ConanCenter."""
+        if self._sources is None:
+            self._sources = source_remotes(self.c, self.s)
+        return self._sources
 
     def _common(self, ref: str, profile: str, opts: Options) -> list[str]:
-        a = ["--requires", ref, "-pr:h", profile, "-pr:b", profile,
-             "-r", self.s["center_remote"], "-c", "tools.graph:skip_binaries=False"]
+        a = ["--requires", ref, "-pr:h", profile, "-pr:b", profile]
+        for r in self.sources():
+            a += ["-r", r]
+        # --update: use the newest recipe revision, not a stale copy in the local cache
+        # (essential for ./recipes, where an edited recipe is otherwise ignored)
+        a += ["--update", "-c", "tools.graph:skip_binaries=False"]
         if opts.build_missing:
             a.append("--build=missing")
         return a
@@ -332,7 +328,8 @@ class Mirror:
         # NB: --graph-binaries is an "append" option: one value per flag, not comma-separated.
         pkglist = self.c.run(["list", f"--graph={graph_file}", "--graph-recipes=*",
                               "--graph-binaries=download", "--graph-binaries=build",
-                              "--graph-binaries=cache", "--format=json"])
+                              "--graph-binaries=cache", "--graph-binaries=update",
+                              "--format=json"])
         list_file.write_text(pkglist, encoding="utf-8")
 
         up = ["upload", f"--list={list_file}", "-r", self.s["nexus_remote"], "-c"]
@@ -555,6 +552,7 @@ class App(tk.Tk):
 
         self._build_search_tab()
         self._build_plan_tab()
+        self._build_internal_tab()
         self._build_profiles_tab()
         self._build_settings_tab()
 
@@ -595,7 +593,7 @@ class App(tk.Tk):
 
         top = ttk.Frame(tab)
         top.pack(fill="x")
-        ttk.Label(top, text="Search ConanCenter:").pack(side="left")
+        ttk.Label(top, text="Search ConanCenter + internal:").pack(side="left")
         self.search_var = tk.StringVar()
         e = ttk.Entry(top, textvariable=self.search_var, width=30)
         e.pack(side="left", padx=4)
@@ -675,7 +673,9 @@ class App(tk.Tk):
 
     def _task_search(self, pat: str, compare: bool):
         s = self.settings
-        refs = self.conan.search(pat, s["center_remote"])
+        refs: list[str] = []
+        for remote in source_remotes(self.conan, s):
+            refs += [r for r in self.conan.search(pat, remote) if r not in refs]
         in_nexus: set[str] | None = None
         if compare and s["nexus_url"]:
             try:
@@ -849,6 +849,175 @@ class App(tk.Tk):
                 r.profile, r.context, r.package_id[:10], r.binary, r.nexus_recipe,
                 "yes" if r.nexus_binary else "no", r.action))
 
+    # ---- Internal packages tab ------------------------------------------
+    def _build_internal_tab(self):
+        tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(tab, text="Internal packages")
+        ttk.Label(tab, foreground="gray", justify="left", wraplength=1100, text=(
+            "For libraries that are not on ConanCenter. Download the source archive yourself, then "
+            "'Create draft': the archive is uploaded to the Nexus raw repo (upstream/<name>/<version>/) "
+            "and a draft recipe is written to ./recipes. Edit the recipe, 'Test build' until it passes, "
+            "then 'Add to mirror list' and mirror it like any other package. "
+            "See docs/INTERNAL_RECIPES.md.")).pack(anchor="w")
+        body = ttk.PanedWindow(tab, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=6)
+
+        self.int_tree = self._tree(body, {"Package / version": 220, "Recipe folder": 200})
+        body.add(self.int_tree.frame, weight=1)
+        self.int_tree.bind("<<TreeviewSelect>>", self.on_internal_select)
+
+        form = ttk.LabelFrame(body, text="New package or new version", padding=8)
+        body.add(form, weight=2)
+        self.ivars = {k: tk.StringVar(value=d) for k, d in {
+            "name": "", "version": "", "archive": "", "start": "cmake template", "base": "",
+            "origin": ""}.items()}
+        rows = [("name", "Package name", "lower case, e.g. cigi-ccl"),
+                ("version", "Version", "e.g. 3.3.3a"),
+                ("archive", "Source archive", "the zip / tar.gz you downloaded"),
+                ("start", "Start the recipe from", ""),
+                ("base", "ConanCenter reference", "only for 'ConanCenter recipe', e.g. cigi-ccl/4.0.6a"),
+                ("origin", "Where the archive came from", "recorded as a comment in conandata.yml")]
+        for i, (k, label, hint) in enumerate(rows):
+            ttk.Label(form, text=label).grid(row=i, column=0, sticky="w", pady=3)
+            if k == "start":
+                w = ttk.Combobox(form, textvariable=self.ivars[k], state="readonly", width=47, values=[
+                    "cmake template", "header-only template", "ConanCenter recipe"])
+            else:
+                w = ttk.Entry(form, textvariable=self.ivars[k], width=50)
+            w.grid(row=i, column=1, sticky="ew", pady=3, padx=6)
+            if k == "archive":
+                ttk.Button(form, text="Browse...", command=self.on_internal_browse).grid(row=i, column=2, sticky="w")
+            else:
+                ttk.Label(form, text=hint, foreground="gray").grid(row=i, column=2, sticky="w")
+        form.columnconfigure(1, weight=1)
+        self.int_upload = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="Upload the archive to the Nexus raw repo", variable=self.int_upload).grid(
+            row=len(rows), column=1, sticky="w", pady=(4, 0))
+        ttk.Label(form, foreground="gray", justify="left", wraplength=560, text=(
+            "An existing recipe is never overwritten: for a package that is already listed, this only "
+            "adds the new version to it. 'Test build' and 'Add to mirror list' use the name and "
+            "version above and the profiles selected on the Search & Mirror tab.")).grid(
+            row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=8)
+        bf = ttk.Frame(form)
+        bf.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="w")
+        for txt, cmd in (("Create draft / add version", self.on_internal_create),
+                         ("Open recipe folder", self.on_internal_open),
+                         ("Test build", self.on_internal_test),
+                         ("Add to mirror list", self.on_internal_add_ref)):
+            ttk.Button(bf, text=txt, command=cmd).pack(side="left", padx=(0, 6))
+        self._fill_internal()
+
+    def _fill_internal(self):
+        tv = self.int_tree
+        tv.delete(*tv.get_children())
+        for name, versions in ir.list_packages().items():
+            parent = tv.insert("", "end", text=name, values=("",), open=True)
+            for v, folder in versions.items():
+                tv.insert(parent, "end", iid=f"{name}/{v}", text=v, values=(f"recipes/{name}/{folder}",))
+
+    def on_internal_select(self, _e=None):
+        sel = self.int_tree.selection()
+        if sel and "/" in sel[0]:
+            name, version = sel[0].split("/", 1)
+            self.ivars["name"].set(name)
+            self.ivars["version"].set(version)
+
+    def on_internal_browse(self):
+        f = filedialog.askopenfilename(title="Source archive", filetypes=[
+            ("Archives", "*.zip *.tar.gz *.tgz *.tar.bz2 *.tar.xz *.tar"), ("All files", "*.*")])
+        if f:
+            self.ivars["archive"].set(f)
+
+    def _internal_ref(self) -> tuple[str, str] | None:
+        name, version = self.ivars["name"].get().strip(), self.ivars["version"].get().strip()
+        if not name or not version:
+            messagebox.showwarning(APP_NAME, "Fill in the package name and version (or pick one in the list).")
+            return None
+        return name, version
+
+    def on_internal_create(self):
+        ref = self._internal_ref()
+        if not ref:
+            return
+        v = {k: x.get().strip() for k, x in self.ivars.items()}
+        base = v["base"] if v["start"] == "ConanCenter recipe" else ""
+        if v["start"] == "ConanCenter recipe" and not base:
+            messagebox.showwarning(APP_NAME, "Enter the ConanCenter reference to start from.")
+            return
+        if not v["archive"]:
+            messagebox.showwarning(APP_NAME, "Choose the source archive you downloaded.")
+            return
+        upload = self.int_upload.get()
+        if upload and not self.creds[0] and not self.ask_creds():
+            return
+        s = self.settings
+
+        def task():
+            d = ir.create_draft(
+                ref[0], ref[1], Path(v["archive"]), s["raw_url"], base=base,
+                template="header-only" if v["start"].startswith("header") else "cmake",
+                origin=v["origin"], upload=upload, user=self.creds[0], password=self.creds[1],
+                cacert=s["cacert_path"], center_remote=s["center_remote"],
+                run_conan=lambda a: self.conan.run(a, quiet=True), log=self.log)
+            ir.ensure_remote(lambda a: self.conan.run(a, quiet=True), s["internal_remote"], log=self.log)
+            self.log(f"Now edit {d / 'conanfile.py'} and press 'Test build'.", "ok")
+            self.ui(self._fill_internal)
+
+        self.run_task(f"Creating draft {ref[0]}/{ref[1]}", self._internal_task, task)
+
+    @staticmethod
+    def _internal_task(task):
+        try:
+            task()
+        except ir.RecipeError as e:
+            raise ConanError(str(e))
+
+    def _internal_dir(self) -> Path | None:
+        ref = self._internal_ref()
+        if not ref:
+            return None
+        folder = ir.list_packages().get(ref[0], {}).get(ref[1])
+        if not folder:
+            messagebox.showwarning(APP_NAME, f"{ref[0]}/{ref[1]} has no recipe yet - create the draft first.")
+            return None
+        return ir.INDEX_ROOT / "recipes" / ref[0] / folder
+
+    def on_internal_open(self):
+        d = self._internal_dir()
+        if d:
+            open_folder(d)
+
+    def on_internal_test(self):
+        if not self._internal_dir():
+            return
+        name, version = self._internal_ref()  # type: ignore[misc]
+        profs = self.selected_profiles()
+        if not profs:
+            messagebox.showwarning(APP_NAME, "Select at least one profile on the Search & Mirror tab.")
+            return
+        if self.settings["raw_url"] and not self.creds[0] and not self.ask_creds():
+            return
+        s = self.settings
+
+        def task():
+            ir.ensure_remote(lambda a: self.conan.run(a, quiet=True), s["internal_remote"], log=self.log)
+            for p in profs:
+                self.log(f"== Test build {name}/{version} [{p}]", "cmd")
+                self.conan.run(ir.test_build_args(name, version, p, s["internal_remote"], s["center_remote"]))
+                self.log(f"== {name}/{version} [{p}]: built", "ok")
+
+        self.run_task(f"Test build {name}/{version}", self._internal_task, task)
+
+    def on_internal_add_ref(self):
+        if not self._internal_dir():
+            return
+        ref = "/".join(self._internal_ref())  # type: ignore[arg-type]
+        current = self.selected_refs()
+        if ref not in current:
+            self.refs_text.delete("1.0", "end")
+            self.refs_text.insert("1.0", "\n".join(current + [ref]))
+        self.nb.select(0)
+
     # ---- Profiles tab -----------------------------------------------------
     def _build_profiles_tab(self):
         tab = ttk.Frame(self.nb, padding=6)
@@ -982,6 +1151,7 @@ class App(tk.Tk):
             ("raw_url", "Nexus raw (sources) URL", "e.g. https://nexus.corp/repository/conan-sources/"),
             ("cacert_path", "CA bundle (optional)", "only if the proxy intercepts TLS"),
             ("nexus_user", "Nexus username", "password is asked per session, never saved"),
+            ("internal_remote", "Internal recipes remote name", "points at ./recipes next to this script"),
         ]
         for i, (k, label, hint) in enumerate(fields):
             ttk.Label(tab, text=label).grid(row=i, column=0, sticky="w", pady=3)
@@ -1020,8 +1190,8 @@ class App(tk.Tk):
         for k in ("nexus_url", "raw_url"):
             new[k] = slash(new[k])
             self.svars[k].set(new[k])
-        if new["nexus_remote"] == new["center_remote"]:
-            messagebox.showerror(APP_NAME, "Nexus and ConanCenter remote names must differ.")
+        if len({new["nexus_remote"], new["center_remote"], new["internal_remote"]}) < 3:
+            messagebox.showerror(APP_NAME, "Nexus, ConanCenter and internal remote names must differ.")
             return False
         self.settings.update(new)
         save_settings(self.settings)
@@ -1046,6 +1216,9 @@ class App(tk.Tk):
                 self.log(f"Remote '{name}' already set to {url}")
             if name in remotes and not remotes[name].get("enabled", True):
                 self.conan.run(["remote", "enable", name])
+
+        if s["internal_remote"] and ir.list_packages():
+            ir.ensure_remote(lambda a: self.conan.run(a, quiet=True), s["internal_remote"], log=self.log)
 
         home = self.conan.home()
         lines = []
