@@ -55,6 +55,10 @@ ConanCenter ──(proxy)──► your machine ──(direct)──► Nexus co
    session and is passed to Conan by environment variable, never on the command line or to disk.
 5. **Profiles** tab → *New from template*: generates e.g. `win-msvc194-cpp20-release`
    / `-debug` for each C++ standard you tick.
+6. **Settings** → *Build profile (for tools)*: enter one of the Release profiles and *Save*.
+   Build tools (cmake, ninja, ...) are then resolved with that profile for every mirror job,
+   so a Debug profile doesn't rebuild them from source. The team config ships the same
+   profile, and developers pass it as `-pr:b`.
 
 ## Team setup
 

@@ -1,7 +1,7 @@
 # Known issues
 
 Findings from a review of `conan_mirror.py`, `team_setup.py` and `check_network.py`
-(November 2026, checked against Conan 2.34). None of these are fixed yet; each entry says
+(November 2026, checked against Conan 2.34). Issues 1, 3 and 4 are fixed (see the end); for the rest, each entry says
 what goes wrong and the suggested fix.
 
 ## What was checked
@@ -23,46 +23,21 @@ what goes wrong and the suggested fix.
 
 ## Issues, most severe first
 
-### 1. The app can freeze permanently after a UI error
-`conan_mirror.py:475` (`App._drain`). If any queued UI callback raises, the exception escapes
-`_drain` before `self.after(80, self._drain)` runs, so the queue is never drained again. The
-app stays "busy", logs stop and every button reports "Another task is running".
-
-**Fix:** wrap each queued call in `try/except` (log the error) and reschedule in a `finally`.
-
 ### 2. "Show effective profile" shows nothing
-`conan_mirror.py:1094`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
+`conan_mirror.py:1108`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
 stderr and returns stdout, which this caller ignores. The same applies to the `conan remote list`
-at the end of *Apply to Conan* (`conan_mirror.py:1246`).
+at the end of *Apply to Conan* (`conan_mirror.py:1262`).
 
 **Fix:** log the returned stdout for these two calls (or add a `log_stdout=True` option to `run`).
 
-### 3. Mirror does not always ask for credentials when the upload needs them
-`conan_mirror.py:794`. The login prompt only appears when *Fetch sources* is ticked. But
-`conan upload` uploads backup sources whenever `core.sources:upload_url` is set, and building
-from source downloads sources regardless of that checkbox. The upload then fails with
-"Authentication to source backup server ... failed".
-
-**Fix:** prompt whenever `raw_url` is set and this is not a dry run.
-
-### 4. Debug profiles are also used for build tools
-`conan_mirror.py:272` passes the same profile as `-pr:h` and `-pr:b`. With a Debug profile,
-tool requirements are resolved as Debug too. Tools whose package ignores the build type are
-unaffected (cmake still downloads), but others (ninja, pkgconf, nasm) have no Debug binaries
-on ConanCenter and get built from source. The README's `-pr:a <profile>` advice to the
-team does the same.
-
-**Fix:** add a "build profile" setting (a Release profile) used for `-pr:b`, and tell the team
-to use `-pr:h <profile> -pr:b <release profile>`.
-
 ### 5. Cancel leaves builds running on macOS/Linux
-`conan_mirror.py:195`. `p.terminate()` only stops the `conan` process; cmake and compiler
+`conan_mirror.py:196`. `p.terminate()` only stops the `conan` process; cmake and compiler
 children keep running. (Windows is fine: it uses `taskkill /T`.)
 
 **Fix:** start Conan with `start_new_session=True` and cancel with `os.killpg(p.pid, SIGTERM)`.
 
 ### 6. Apply replaces the whole `source_credentials.json`
-`conan_mirror.py:1239`. A `.bak` is kept, but credentials for any other URLs in the file stop
+`conan_mirror.py:1255`. A `.bak` is kept, but credentials for any other URLs in the file stop
 working.
 
 **Fix:** merge our entry into the existing `credentials` list instead of overwriting the file.
@@ -74,7 +49,7 @@ still calls `input()`.
 **Fix:** with `--yes` and no `--user`, fall back to `getpass.getuser()` without prompting.
 
 ### 8. Profile wizard writes incomplete profiles for some compilers
-`conan_mirror.py:355` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
+`conan_mirror.py:358` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
 for apple-clang. gcc on Windows (MinGW) gets none, and C++ packages are then invalid for that
 profile ("'settings.compiler.libcxx' value not defined"). Clang on Windows or macOS also gets
 none; Conan accepts that, but on macOS the standard library is then missing from the profile.
@@ -95,3 +70,18 @@ on Windows without it.
 - **Conan 2.34 has a new `core.net.http:trust_store` setting.** It verifies against the OS
   certificate store, but needs `pip install truststore` alongside Conan. Not needed for our
   setup; noted for reference.
+
+## Fixed
+
+Numbers are kept from the original review so references to them still work.
+
+- **1. The app could freeze permanently after a UI error.** `App._drain` now catches an error
+  in a queued update, logs it, and always reschedules itself.
+- **3. Mirror did not always ask for credentials.** The login prompt now appears whenever the
+  raw repo is configured, not only when *Fetch sources* is ticked.
+- **4. Debug profiles were also used for build tools.** There is a *Build profile* setting
+  (a Release profile) used for `-pr:b` in Plan, Mirror and Test build. The exported team
+  config ships that profile and its README tells developers to pass it. It is empty by
+  default, which keeps the old behaviour, so set it under Settings. Checked against
+  ConanCenter: with a Debug host profile, `ninja` as a build tool went from "build from
+  source" to "download".

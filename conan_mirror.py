@@ -60,6 +60,7 @@ DEFAULTS = {
     "cacert_path": "",        # optional CA bundle if the proxy intercepts TLS
     "nexus_user": "",
     "internal_remote": "internal",   # local-recipes-index remote for ./recipes
+    "build_profile": "",             # Release profile for build tools; empty = same as host
 }
 
 
@@ -269,7 +270,9 @@ class Mirror:
         return self._sources
 
     def _common(self, ref: str, profile: str, opts: Options) -> list[str]:
-        a = ["--requires", ref, "-pr:h", profile, "-pr:b", profile]
+        # Build tools (cmake, ninja, ...) use one fixed Release profile when set, so a Debug
+        # host profile does not ask for Debug tools that have to be built from source.
+        a = ["--requires", ref, "-pr:h", profile, "-pr:b", self.s.get("build_profile") or profile]
         for r in self.sources():
             a += ["-r", r]
         # --update: use the newest recipe revision, not a stale copy in the local cache
@@ -476,13 +479,20 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.q.get_nowait()
-                if item[0] == "log":
-                    self._append_log(item[1], item[2])
-                else:
-                    item[1](*item[2])
+                try:
+                    if item[0] == "log":
+                        self._append_log(item[1], item[2])
+                    else:
+                        item[1](*item[2])
+                except Exception as e:  # noqa: BLE001 - one bad update must not stop the queue
+                    try:
+                        self._append_log(f"ERROR in UI update: {type(e).__name__}: {e}", "err")
+                    except Exception:  # noqa: BLE001
+                        pass
         except queue.Empty:
             pass
-        self.after(80, self._drain)
+        finally:
+            self.after(80, self._drain)
 
     def run_task(self, title: str, fn, *args) -> None:
         if self.busy:
@@ -791,9 +801,12 @@ class App(tk.Tk):
         if not ready:
             return
         opts = self.options()
-        if self.settings["raw_url"] and opts.fetch_sources and not self.creds[0] and not opts.dry_run:
-            if messagebox.askyesno(APP_NAME, "Uploading sources to the raw repo needs your Nexus "
-                                             "credentials for this session. Log in now?"):
+        # conan upload sends backup sources whenever the raw repo is configured, whatever the
+        # checkboxes say, and internal packages download their sources from it.
+        if self.settings["raw_url"] and not self.creds[0]:
+            if messagebox.askyesno(APP_NAME, "The Nexus raw repo needs your Nexus credentials for this "
+                                             "session (to upload sources, and to download the sources "
+                                             "of internal packages). Log in now?"):
                 if not self.ask_creds():
                     return
         refs, profs = ready
@@ -1003,7 +1016,8 @@ class App(tk.Tk):
             ir.ensure_remote(lambda a: self.conan.run(a, quiet=True), s["internal_remote"], log=self.log)
             for p in profs:
                 self.log(f"== Test build {name}/{version} [{p}]", "cmd")
-                self.conan.run(ir.test_build_args(name, version, p, s["internal_remote"], s["center_remote"]))
+                self.conan.run(ir.test_build_args(name, version, p, s["internal_remote"],
+                                                  s["center_remote"], s["build_profile"]))
                 self.log(f"== {name}/{version} [{p}]: built", "ok")
 
         self.run_task(f"Test build {name}/{version}", self._internal_task, task)
@@ -1152,6 +1166,8 @@ class App(tk.Tk):
             ("cacert_path", "CA bundle (optional)", "only if the proxy intercepts TLS"),
             ("nexus_user", "Nexus username", "password is asked per session, never saved"),
             ("internal_remote", "Internal recipes remote name", "points at ./recipes next to this script"),
+            ("build_profile", "Build profile (for tools)", "a Release profile, e.g. win-msvc194-cpp20-release; "
+                                                           "empty = same as each host profile"),
         ]
         for i, (k, label, hint) in enumerate(fields):
             ttk.Label(tab, text=label).grid(row=i, column=0, sticky="w", pady=3)
@@ -1320,6 +1336,17 @@ class App(tk.Tk):
             return
         # never ship 'default': it is machine-detected and would clobber each developer's own
         profs = [p for p in (self.selected_profiles() or self.profiles) if p != "default"]
+        bp = s["build_profile"]
+        if bp == "default":
+            messagebox.showwarning(APP_NAME, "The build profile is 'default', which is never exported "
+                                             "(it is different on every machine). Choose a named "
+                                             "Release profile under Settings first.")
+            return
+        if bp and bp not in profs:
+            if bp not in self.profiles:
+                messagebox.showwarning(APP_NAME, f"Build profile '{bp}' does not exist - fix it under Settings.")
+                return
+            profs.append(bp)
         if not messagebox.askyesno(APP_NAME, f"Include {len(profs)} profile(s)?\n\n" + "\n".join(profs)
                                    + "\n\n(Select profiles on the Search tab to limit this.)"):
             return
@@ -1334,6 +1361,11 @@ class App(tk.Tk):
             "disable_remotes": [s["center_remote"]],
             "msvc_fallbacks": {"195": "194", "194": "193"},
         }
+        install_profiles = f"-pr:h <profile> -pr:b {bp}" if bp else "-pr:a <profile>"
+        build_profile_note = (f"""
+Always pass  -pr:b {bp}  as shown: packages in Nexus were built with that
+build profile, and a different one can make Conan rebuild tools from source.
+""" if bp else "")
         readme = f"""Team Conan configuration
 ========================
 
@@ -1351,8 +1383,8 @@ What 'apply' does (all backed up first, in %APPDATA%\\ConanTeamSetup):
 
 Then use Conan as normal, e.g.:
 
-    conan install . -pr:a <profile> --build=missing
-
+    conan install . {install_profiles} --build=missing
+{build_profile_note}
 If a package is missing from Nexus, ask the Conan admin to mirror it
 (name/version + which profile you are using).
 """
