@@ -31,6 +31,9 @@ versions:
     folder: "3.x"
 ```
 
+`3.3.3a` is a placeholder used throughout this guide: check the exact release name on
+SourceForge and use that as the version.
+
 Use a separate `3.x` folder rather than adding 3.3 to a copy of the 4.x recipe: the 3.3 source
 tree may build differently, and keeping them apart means a fix for one can't break the other.
 
@@ -86,8 +89,10 @@ git clone <recipes repo url> C:\conan\conan-recipes
 conan remote add internal C:\conan\conan-recipes --type=local-recipes-index
 ```
 
-Conan reads recipes straight from that folder, so after a `git pull` the new recipes are
-available without re-adding the remote.
+Conan reads recipes straight from that folder, so after a `git pull` new packages and
+versions are available without re-adding the remote. A changed recipe for a version that is
+already in the local cache is **not** picked up unless you pass `--update`; without it Conan
+keeps using the cached copy. The commands below include `--update` for that reason.
 
 Don't put this remote in the team config: `team_setup.py` only configures Nexus, and that's
 where the built packages end up.
@@ -97,7 +102,7 @@ where the built packages end up.
 Build it for one profile first, using ConanCenter for anything else it needs:
 
 ```bash
-conan install --requires cigi-ccl/3.3.3a -r internal -r conancenter -pr:h win-msvc194-cpp20-release -pr:b win-msvc194-cpp20-release --build=missing
+conan install --requires cigi-ccl/3.3.3a -r internal -r conancenter -pr:h win-msvc194-cpp20-release -pr:b win-msvc194-cpp20-release --build=missing --update
 ```
 
 Fix the recipe until this passes for every profile you care about (Release and Debug, static
@@ -111,11 +116,11 @@ The Conan Mirror GUI currently resolves packages from **one** source remote (the
 by hand, for each profile:
 
 ```bash
-conan install --requires cigi-ccl/3.3.3a -r internal -r conancenter -pr:h <profile> -pr:b <profile> --build=missing -c tools.graph:skip_binaries=False -c tools.build:download_source=True --format=json > graph.json
+conan install --requires cigi-ccl/3.3.3a -r internal -r conancenter -pr:h <profile> -pr:b <profile> --build=missing --update -c tools.graph:skip_binaries=False -c tools.build:download_source=True --format=json --out-file graph.json
 ```
 
 ```bash
-conan list --graph=graph.json --graph-recipes=* --graph-binaries=download --graph-binaries=build --graph-binaries=cache --format=json > pkglist.json
+conan list --graph=graph.json --graph-recipes=* --graph-binaries=download --graph-binaries=build --graph-binaries=cache --format=json --out-file pkglist.json
 ```
 
 ```bash
@@ -126,8 +131,18 @@ The upload pushes the recipe, every binary in the graph, and (because `core.sour
 is set by *Apply to Conan*) the source archive to the Nexus raw repo. Log in to Nexus first so
 the raw-repo upload has credentials. Add `--dry-run` to the upload for a first test.
 
-Afterwards the Plan tab works normally for checking it: search Nexus for `cigi-ccl` to confirm
-the version and binaries are there.
+Use `--out-file` rather than `> file`: in Windows PowerShell the redirect writes UTF-16, which
+the next command may fail to read.
+
+To confirm the version and its binaries are in Nexus, ask Nexus directly:
+
+```bash
+conan list "cigi-ccl/3.3.3a:*" -r nexus
+```
+
+The GUI is not a reliable check here. Its Search tab lists what is on ConanCenter, so an
+internal-only version never appears. The Plan tab does resolve the package, but only from the
+local cache left by the build above, not from the `internal` remote.
 
 ### Planned GUI support (not implemented)
 
@@ -145,6 +160,8 @@ conan install . -pr:h <profile> -pr:b <profile>
 
 with `cigi-ccl/3.3.3a` in their `conanfile`. If they need a profile that hasn't been mirrored,
 `--build=missing` builds it from the recipe in Nexus using the source archive from the raw repo.
+That download only works if the raw repo allows anonymous read: `team_setup.py` does not give
+developers credentials for it.
 
 ## Adding more internal packages
 
