@@ -1,18 +1,21 @@
 # Known issues
 
-Findings from a review of `conan_mirror.py`, `team_setup.py` (since replaced by
+Findings from a review of `conan_mirror.py` (since split into `mirror_core.py`, `gui.py` and
+`gui_theme.py`; line numbers below are in those files), `team_setup.py` (since replaced by
 `conan config install`, see the README) and `check_network.py`
 (November 2026, checked against Conan 2.34). Issues 1, 3, 4, 6 and 7 are fixed or gone (see the end); for the rest, each entry says
 what goes wrong and the suggested fix.
 
 ## What was checked
 
-- **Dependencies:** all three scripts import only the Python standard library, so what we
+- **Dependencies:** the scripts import only the Python standard library, so what we
   ship has no third-party dependencies. Caveats:
-  - tkinter is not always present (Homebrew Python needs `brew install python-tk`).
-  - `check_network.py:103` calls `ssl._ssl._test_decode_cert`. It is in the standard
+  - tkinter is not always present (Homebrew Python needs `brew install python-tk`). Only the GUI
+    needs it: `conan_mirror.py --manifest` runs without tkinter.
+  - `check_network.py:105` calls `ssl._ssl._test_decode_cert`. It is in the standard
     library but private, so a future Python release could remove it.
-- **Static checks:** ruff and mypy report only typing nitpicks, no real errors.
+- **Static checks:** every script passes `python -m mypy` in strict mode (configured in
+  `pyproject.toml`), checked for Windows, macOS and Linux.
 - **Conan behaviour:** the flags the mirror relies on (`tools.graph:skip_binaries`,
   `tools.build:download_source`, `conan list --graph-binaries=...`, `conan upload --list`,
   `CONAN_PASSWORD_<REMOTE>` for `conan remote login`, Jinja in `source_credentials.json`)
@@ -21,20 +24,20 @@ what goes wrong and the suggested fix.
 ## Issues, most severe first
 
 ### 2. "Show effective profile" shows nothing
-`conan_mirror.py:1421`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
+`gui.py:855`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
 stderr and returns stdout, which this caller ignores. The same applies to the `conan remote list`
-at the end of *Apply to Conan* (`conan_mirror.py:569`).
+at the end of *Apply to Conan* (`mirror_core.py:580`).
 
 **Fix:** log the returned stdout for these two calls (or add a `log_stdout=True` option to `run`).
 
 ### 5. Cancel leaves builds running on macOS/Linux
-`conan_mirror.py:202`. `p.terminate()` only stops the `conan` process; cmake and compiler
+`mirror_core.py:199`. `p.terminate()` only stops the `conan` process; cmake and compiler
 children keep running. (Windows is fine: it uses `taskkill /T`.)
 
 **Fix:** start Conan with `start_new_session=True` and cancel with `os.killpg(p.pid, SIGTERM)`.
 
 ### 8. Profile wizard writes incomplete profiles for some compilers
-`conan_mirror.py:601` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
+`mirror_core.py:605` (`make_profile`). `compiler.libcxx` is only set for gcc/clang on Linux and
 for apple-clang. gcc on Windows (MinGW) gets none, and C++ packages are then invalid for that
 profile ("'settings.compiler.libcxx' value not defined"). Clang on Windows or macOS also gets
 none; Conan accepts that, but on macOS the standard library is then missing from the profile.

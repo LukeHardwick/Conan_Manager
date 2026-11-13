@@ -7,6 +7,8 @@ your team only ever talks to Nexus.
 | File | Purpose |
 |---|---|
 | `conan_mirror.py` | The GUI. Run `python conan_mirror.py`. With `--manifest` it runs without the GUI. |
+| `mirror_core.py` | Settings, the Conan runner, plan / mirror / verify. No tkinter, shared by the GUI and `--manifest` |
+| `gui.py`, `gui_theme.py` | The window, its tabs and the light / dark colours |
 | `internal_recipes.py` | Draft and test recipes for packages that aren't on ConanCenter (also the GUI's *Internal packages* tab) |
 | `team_config.py` | Builds the configuration the team installs with `conan config install` |
 | `check_network.py` | Proxy / Nexus / TLS-interception check (also run from the GUI) |
@@ -184,3 +186,5 @@ first. The profiles named in the manifest must exist in that Conan home.
 - **Dark mode:** tick *Dark mode* on the Settings tab and *Save*. It takes effect the next
   time you start the GUI.
 - Settings, work files and the mirror's Conan home live in `~/.conan_mirror/`.
+- **Type checking:** `python -m mypy` (strict, settings in `pyproject.toml`). Only needed when
+  changing the scripts.
