@@ -66,7 +66,83 @@ DEFAULTS = {
     "build_profile": "",             # Release profile for build tools; empty = same as host
     "conan_home": str(ir.DEFAULT_CONAN_HOME),   # the mirror's own Conan home; empty = your normal one
     "msvc_fallbacks": dict(tc.DEFAULT_FALLBACKS),  # newer MSVC -> older MSVC whose binaries it may use
+    "dark_mode": False,              # GUI colours; takes effect when the GUI starts
 }
+
+# Text colours for log lines and tree rows (cmd/ok/err/warn), per theme.
+# Every Tk widget sharing this dict means one apply_theme() call recolours everything.
+LIGHT_TAGS = {"cmd": "#2060c0", "ok": "#208020", "err": "#c02020", "warn": "#b07000"}
+DARK_TAGS = {"cmd": "#6ea8ff", "ok": "#5cc16a", "err": "#ff6b6b", "warn": "#e0a040"}
+TAGS = dict(LIGHT_TAGS)
+
+DARK = {
+    "bg": "#202124",        # windows, frames, tabs
+    "field": "#2b2c2f",     # entries, text boxes, lists
+    "raised": "#34363a",    # buttons, selected tab, headings
+    "hover": "#3e4045",
+    "border": "#4a4c50",
+    "fg": "#e6e6e6",
+    "fg_dim": "#8a8a8a",    # disabled text
+    "select": "#2f5d9e",    # selection highlight
+}
+
+
+def apply_theme(root: tk.Misc, dark: bool) -> None:
+    """Pick the ttk theme and colours. Call before any widget is created: plain Tk widgets
+    (Text, Listbox, dialogs) take their colours from the option database at creation time."""
+    style = ttk.Style(root)
+    if not dark:
+        TAGS.update(LIGHT_TAGS)
+        if sys.platform == "win32":
+            style.theme_use("vista")
+        return
+
+    TAGS.update(DARK_TAGS)
+    c = DARK
+    style.theme_use("clam")  # the built-in theme that honours custom colours on every platform
+    style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
+                    bordercolor=c["border"], darkcolor=c["bg"], lightcolor=c["raised"],
+                    troughcolor=c["field"], selectbackground=c["select"], selectforeground="#ffffff",
+                    insertcolor=c["fg"], arrowcolor=c["fg"], focuscolor=c["border"])
+    style.map(".", foreground=[("disabled", c["fg_dim"])],
+              background=[("disabled", c["bg"])])
+    style.configure("TButton", background=c["raised"])
+    style.map("TButton", background=[("disabled", c["bg"]), ("pressed", c["border"]),
+                                     ("active", c["hover"])])
+    for w in ("TCheckbutton", "TRadiobutton"):
+        style.configure(w, indicatorbackground=c["field"], indicatorforeground=c["fg"])
+        style.map(w, background=[("active", c["bg"])],
+                  indicatorbackground=[("pressed", c["raised"]), ("selected", c["select"])])
+    style.configure("TNotebook", background=c["bg"], bordercolor=c["border"])
+    style.configure("TNotebook.Tab", background=c["bg"], padding=(10, 3))
+    style.map("TNotebook.Tab", background=[("selected", c["raised"]), ("active", c["hover"])])
+    style.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["fg"])
+    style.map("Treeview", background=[("selected", c["select"])], foreground=[("selected", "#ffffff")])
+    style.configure("Treeview.Heading", background=c["raised"], foreground=c["fg"])
+    style.map("Treeview.Heading", background=[("active", c["hover"])])
+    style.map("TCombobox", fieldbackground=[("readonly", c["field"]), ("disabled", c["bg"])],
+              foreground=[("readonly", c["fg"]), ("disabled", c["fg_dim"])],
+              selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["fg"])])
+    style.map("TEntry", fieldbackground=[("readonly", c["bg"]), ("disabled", c["bg"])])
+    style.configure("TScrollbar", background=c["raised"], arrowcolor=c["fg"])
+    style.map("TScrollbar", background=[("active", c["hover"])])
+    style.configure("TProgressbar", background=c["select"])
+    style.configure("TLabelframe", background=c["bg"], bordercolor=c["border"])
+    style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+
+    # plain Tk widgets: Text, Listbox, the combobox drop-down, Toplevels and simpledialog boxes
+    root.configure(background=c["bg"])
+    for pattern, value in (
+            ("*Background", c["bg"]), ("*Foreground", c["fg"]),
+            ("*Text.Background", c["field"]), ("*Listbox.Background", c["field"]),
+            ("*Entry.Background", c["field"]), ("*Button.Background", c["raised"]),
+            ("*activeBackground", c["hover"]), ("*activeForeground", c["fg"]),
+            ("*selectBackground", c["select"]), ("*selectForeground", "#ffffff"),
+            ("*insertBackground", c["fg"]), ("*highlightBackground", c["bg"]),
+            ("*highlightColor", c["border"]), ("*disabledForeground", c["fg_dim"]),
+            ("*TCombobox*Listbox.background", c["field"]),
+            ("*TCombobox*Listbox.foreground", c["fg"])):
+        root.option_add(pattern, value)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -781,9 +857,7 @@ class App(tk.Tk):
 
     # ---- layout -----------------------------------------------------------
     def _build_ui(self):
-        style = ttk.Style(self)
-        if sys.platform == "win32":
-            style.theme_use("vista")
+        apply_theme(self, bool(self.settings.get("dark_mode")))
         paned = ttk.PanedWindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=6, pady=(6, 0))
         self.nb = ttk.Notebook(paned)
@@ -798,9 +872,8 @@ class App(tk.Tk):
         mono = ("Consolas", 9) if sys.platform == "win32" else ("Menlo", 11)
         self.logbox = ScrolledText(logf, height=10, font=mono, wrap="none")
         self.logbox.pack(fill="both", expand=True)
-        self.logbox.tag_configure("cmd", foreground="#2060c0")
-        self.logbox.tag_configure("err", foreground="#c02020")
-        self.logbox.tag_configure("ok", foreground="#208020")
+        for tag in ("cmd", "err", "ok"):
+            self.logbox.tag_configure(tag, foreground=TAGS[tag])
 
         sb = ttk.Frame(self)
         sb.pack(fill="x", padx=6, pady=4)
@@ -843,9 +916,9 @@ class App(tk.Tk):
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         tv.frame = frame  # type: ignore[attr-defined]
-        tv.tag_configure("good", foreground="#208020")
-        tv.tag_configure("bad", foreground="#c02020")
-        tv.tag_configure("warn", foreground="#b07000")
+        tv.tag_configure("good", foreground=TAGS["ok"])
+        tv.tag_configure("bad", foreground=TAGS["err"])
+        tv.tag_configure("warn", foreground=TAGS["warn"])
         return tv
 
     # ---- Search tab -----------------------------------------------------
@@ -1518,6 +1591,13 @@ class App(tk.Tk):
         tab.columnconfigure(1, weight=1)
 
         r = len(fields)
+        self.dark_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
+        ttk.Checkbutton(tab, text="Dark mode", variable=self.dark_var).grid(row=r, column=1, sticky="w",
+                                                                           padx=6, pady=3)
+        ttk.Label(tab, text="takes effect the next time the GUI starts", foreground="gray").grid(
+            row=r, column=2, sticky="w")
+
+        r += 1
         bf = ttk.Frame(tab)
         bf.grid(row=r, column=0, columnspan=3, sticky="w", pady=(12, 4))
         for txt, cmd in (("Save", self.on_settings_save),
@@ -1551,9 +1631,14 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "Nexus, ConanCenter and internal remote names must differ.")
             return False
         home_changed = new["conan_home"] != self.settings.get("conan_home")
+        new["dark_mode"] = self.dark_var.get()
+        theme_changed = new["dark_mode"] != bool(self.settings.get("dark_mode"))
         self.settings.update(new)
         save_settings(self.settings)
         self.log(f"Settings saved to {SETTINGS_FILE}", "ok")
+        if theme_changed:
+            self.log(f"{'Dark' if new['dark_mode'] else 'Light'} mode will be used the next time you "
+                     "start the GUI.")
         if home_changed:
             self.conan._home = None
             self.log("Conan home changed - press 'Apply to Conan', then check the Profiles tab.", "err")
