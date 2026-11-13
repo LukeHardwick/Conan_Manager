@@ -71,6 +71,43 @@ def looks_public(issuer: str) -> bool:
     return any(h in low for h in PUBLIC_CA_HINTS)
 
 
+_advised: list[bool] = []    # proxy_auth_advice() has run
+
+
+class ProxyAuthRequired(ConnectionError):
+    """The proxy answered 407: it wants a login before it forwards anything."""
+
+    def __init__(self, schemes: list[str]):
+        self.schemes = schemes
+        super().__init__("HTTP 407 Proxy Authentication Required"
+                         + (f" (asks for: {', '.join(schemes)})" if schemes else ""))
+
+
+def proxy_auth_advice(schemes: list[str], proxy_has_login: bool) -> None:
+    """Explain a 407: what the proxy wants, and what will make Conan work. Printed once."""
+    if _advised:
+        print("       (see the explanation above)")
+        return
+    _advised.append(True)
+    names = {s.split()[0].lower() for s in schemes if s.strip()}
+    print("       The PROXY (not ConanCenter) wants a login. Browsers do this silently; Python and")
+    print("       Conan get this 407 instead, so mirroring fails until it is solved.")
+    if proxy_has_login:
+        print("       A user name is in the proxy setting but the proxy still refused it: check the")
+        print("       user name (DOMAIN\\user or user@domain) and password, or see the options below.")
+    if names & {"negotiate", "ntlm", "kerberos"}:
+        print("       It asks for Windows sign-in (NTLM / Negotiate), which Conan cannot do. Either:")
+        print("         - ask IT to let this machine reach center2.conan.io and github.com without")
+        print("           proxy authentication, or")
+        print("         - run a local helper proxy that signs in with your Windows account (e.g. Px or")
+        print("           CNTLM) and put its address, e.g. 127.0.0.1:3128, in the Proxy setting.")
+    if "basic" in names:
+        print("       It accepts Basic login: put it in the proxy setting as user:password@host:port.")
+        print("       Note that the setting is saved in ~/.conan_mirror/settings.json.")
+    if not names:
+        print("       It did not say which login it wants (no Proxy-Authenticate header).")
+
+
 def open_tunnel(proxy: str | None, host: str, port: int, timeout: float) -> socket.socket:
     """TCP connection to host:port, through an HTTP CONNECT proxy if given."""
     if not proxy:
@@ -88,7 +125,12 @@ def open_tunnel(proxy: str | None, host: str, port: int, timeout: float) -> sock
         if not chunk:
             break
         resp += chunk
-    status = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+    head = resp.split(b"\r\n\r\n", 1)[0].decode(errors="replace").split("\r\n")
+    status = head[0]
+    if " 407" in status:
+        sock.close()
+        raise ProxyAuthRequired([ln.split(":", 1)[1].strip() for ln in head[1:]
+                                 if ln.lower().startswith("proxy-authenticate:")])
     if " 200" not in status:
         sock.close()
         raise ConnectionError(f"proxy refused CONNECT: {status!r}")
@@ -138,6 +180,10 @@ def tls_probe(proxy: str | None, url: str, timeout: float, save_dir: Path) -> bo
                 return True
     except ssl.SSLCertVerificationError as e:
         say(WARN, f"TLS to {host} ({via}) not trusted by Python's trust store: {e.verify_message}")
+    except ProxyAuthRequired as e:
+        say(FAIL, f"proxy refused the tunnel to {host}: {e}")
+        proxy_auth_advice(e.schemes, bool(proxy and urlparse(proxy).username))
+        return False
     except Exception as e:  # noqa: BLE001
         say(FAIL, f"could not connect to {host} ({via}): {e}")
         return False
@@ -192,6 +238,11 @@ def http_probe(proxy: str | None, url: str, timeout: float) -> bool:
             say(OK, f"GET {url} ({via}) -> HTTP {r.status}")
             return True
     except urllib.error.HTTPError as e:
+        if e.code == 407:   # from the proxy, not the server: nothing got through
+            say(FAIL, f"GET {url} ({via}) -> HTTP 407 Proxy Authentication Required")
+            proxy_auth_advice(e.headers.get_all("Proxy-Authenticate") or [],
+                              bool(proxy and urlparse(proxy).username))
+            return False
         say(OK, f"GET {url} ({via}) -> HTTP {e.code} (server reachable)")
         return True
     except Exception as e:  # noqa: BLE001
