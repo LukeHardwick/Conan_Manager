@@ -3,7 +3,7 @@
 Findings from a review of `conan_mirror.py` (since split into `mirror_core.py`, `gui.py` and
 `gui_theme.py`; line numbers below are in those files), `team_setup.py` (since replaced by
 `conan config install`, see the README) and `check_network.py`
-(November 2026, checked against Conan 2.34). Issues 1, 3, 4, 6 and 7 are fixed or gone (see the end); for the rest, each entry says
+(November 2026, checked against Conan 2.34). Issues 1, 2, 3, 4, 6 and 7 are fixed or gone (see the end); for the rest, each entry says
 what goes wrong and the suggested fix.
 
 ## What was checked
@@ -22,13 +22,6 @@ what goes wrong and the suggested fix.
   all behave as the code expects.
 
 ## Issues, most severe first
-
-### 2. "Show effective profile" shows nothing
-`gui.py:855`. `conan profile show` prints to **stdout**, but `Conan.run` only logs
-stderr and returns stdout, which this caller ignores. The same applies to the `conan remote list`
-at the end of *Apply to Conan* (`mirror_core.py:580`).
-
-**Fix:** log the returned stdout for these two calls (or add a `log_stdout=True` option to `run`).
 
 ### 5. Cancel leaves builds running on macOS/Linux
 `mirror_core.py:199`. `p.terminate()` only stops the `conan` process; cmake and compiler
@@ -63,6 +56,9 @@ Numbers are kept from the original review so references to them still work.
 
 - **1. The app could freeze permanently after a UI error.** `App._drain` now catches an error
   in a queued update, logs it, and always reschedules itself.
+- **2. "Show effective profile" and the end of *Apply to Conan* showed nothing.** Both
+  commands print their answer on stdout, which `Conan.run` returned but nobody logged. They
+  now use `Conan.show`, which copies that answer to the log.
 - **3. Mirror did not always ask for credentials.** The login prompt now appears whenever the
   raw repo is configured, not only when *Fetch sources* is ticked.
 - **4. Debug profiles were also used for build tools.** There is a *Build profile* setting

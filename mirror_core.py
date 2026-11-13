@@ -174,6 +174,14 @@ class Conan:
             raise ConanError(f"'conan {' '.join(args[:2])}' failed (exit {p.returncode}): {last}")
         return out
 
+    def show(self, args: list[str]) -> str:
+        """Run a command whose answer is printed on stdout (remote list, profile show) and copy
+        that answer to the log. run() alone logs only stderr, Conan's progress messages."""
+        out = self.run(args)
+        for line in out.rstrip().splitlines():
+            self.host.log(ANSI.sub("", line))
+        return out
+
     def json(self, args: list[str], quiet: bool = False) -> Any:
         """Parsed `--format=json` output. Its shape depends on the command, so it is Any here
         and each caller annotates what it reads."""
@@ -577,7 +585,7 @@ def apply_config(conan: Conan, s: Settings, log: Log) -> None:
     elif s.get("msvc_fallbacks", tc.DEFAULT_FALLBACKS):
         log("WARNING: could not add the MSVC fallbacks to the compatibility plugin "
                  "(unexpected layout in this Conan version)", "err")
-    conan.run(["remote", "list"])
+    conan.show(["remote", "list"])
 
 
 def write_managed_block(path: Path, lines: list[str], log: Log) -> None:

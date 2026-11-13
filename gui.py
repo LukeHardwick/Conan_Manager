@@ -855,7 +855,7 @@ class App(tk.Tk):
     def on_profile_show(self) -> None:
         name = self.current_profile
         if name:
-            self.run_task("Show profile", lambda: self.conan.run(
+            self.run_task("Show profile", lambda: self.conan.show(
                 ["profile", "show", "-pr:h", name, "-pr:b", name]))
 
     def _write_profiles(self, profiles: dict[str, str]) -> None:
