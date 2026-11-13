@@ -865,7 +865,14 @@ class App(tk.Tk):
                 APP_NAME, "Overwrite existing profiles?\n\n" + "\n".join(existing)):
             profiles = {k: v for k, v in profiles.items() if k not in existing}
         for name, text in profiles.items():
-            (d / name).write_text(text, encoding="utf-8")
+            path = d / name
+            try:
+                # a new Conan home has no profiles/ folder yet; imported names may have sub-folders
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            except OSError as e:
+                messagebox.showerror(APP_NAME, f"Could not write profile {name}:\n{e}")
+                break
             self.log(f"Created profile {name}", "ok")
         self.run_task("Loading profiles", self._task_load_profiles)
 

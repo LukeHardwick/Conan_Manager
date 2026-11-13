@@ -85,6 +85,10 @@ Profiles tab or copy your existing ones with *Import from my normal Conan home*.
    and whether the proxy intercepts TLS. If it does, run
    `python check_network.py --export-bundle C:\conan\ca-bundle.pem`, then put that
    path in *CA bundle* (Conan uses its own CA list, not the Windows store).
+   If it reports **407 Proxy Authentication Required**, the proxy wants a login that browsers
+   send silently but Conan cannot. When it asks for Windows sign-in (NTLM / Negotiate), ask
+   IT to let this machine reach ConanCenter and GitHub without proxy authentication, or run a
+   local helper proxy that signs in for you (e.g. Px or CNTLM) and enter its address as the proxy.
 3. **Apply to Conan**: sets up the mirror's Conan home. It adds the remotes, writes a marked
    block to `global.conf`, writes a `source_credentials.json` that reads credentials from
    environment variables, and adds the MSVC fallbacks (195→194, 194→193) to the compatibility
