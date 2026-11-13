@@ -1,0 +1,22 @@
+# Type checking only: the scripts are run directly and use the standard library alone.
+#   python -m mypy
+[tool.mypy]
+python_version = "3.11"
+files = ["*.py"]
+strict = true
+warn_unreachable = true
+extra_checks = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-expr",
+    "redundant-self",
+    "truthy-bool",
+    "truthy-iterable",
+    "possibly-undefined",
+    "explicit-override",
+    "mutable-override",
+    "deprecated",
+    "exhaustive-match",
+    "unimported-reveal",
+    "narrowed-type-not-subtype",
+]

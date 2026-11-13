@@ -38,7 +38,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
+from http.client import HTTPResponse
 from pathlib import Path
+from typing import BinaryIO, Protocol, TypedDict
 from urllib.parse import quote, urlparse
 
 HERE = Path(__file__).resolve().parent
@@ -55,8 +58,39 @@ class RecipeError(Exception):
     pass
 
 
+class Settings(TypedDict, total=False):
+    """~/.conan_mirror/settings.json. Every key is optional on disk; the GUI fills in defaults."""
+    conan_exe: str
+    center_remote: str
+    center_url: str
+    nexus_remote: str
+    nexus_url: str
+    raw_url: str
+    proxy: str
+    cacert_path: str
+    nexus_user: str
+    internal_remote: str
+    build_profile: str
+    conan_home: str
+    msvc_fallbacks: dict[str, str]
+    dark_mode: bool
+
+
+class Log(Protocol):
+    """Where progress messages go: the GUI's log pane, or stdout. `tag` is cmd/ok/err or ""."""
+    def __call__(self, text: str, tag: str = "") -> None: ...
+
+
+def print_log(text: str, tag: str = "") -> None:
+    print(text, flush=True)
+
+
+RunConan = Callable[[list[str]], str]
+"""Runs `conan <args>` and returns its stdout; raises on failure."""
+
+
 # --------------------------------------------------------------------------- environment
-def conan_env(settings: dict, user: str = "", password: str = "") -> dict:
+def conan_env(settings: Settings, user: str = "", password: str = "") -> dict[str, str]:
     """Environment for running conan: proxy for ConanCenter only, Nexus credentials."""
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
@@ -114,12 +148,14 @@ class NexusRaw:
         if user:
             self._auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 
-    def _open(self, url: str, method: str, data=None, headers: dict | None = None):
+    def _open(self, url: str, method: str, data: BinaryIO | None = None,
+              headers: dict[str, str] | None = None) -> HTTPResponse | None:
         req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
         if self._auth:
             req.add_header("Authorization", self._auth)
         try:
-            return self._opener.open(req, timeout=120)
+            resp: HTTPResponse = self._opener.open(req, timeout=120)
+            return resp
         except urllib.error.HTTPError as e:
             if e.code == 404 and method in ("HEAD", "GET"):
                 return None
@@ -148,7 +184,7 @@ class NexusRaw:
                 r.close()
 
 
-def publish_archive(archive: Path, url: str, sha: str, nexus: NexusRaw, log=print) -> None:
+def publish_archive(archive: Path, url: str, sha: str, nexus: NexusRaw, log: Log = print_log) -> None:
     """Upload the archive unless the same file is already there. Never overwrites."""
     existing = nexus.remote_sha256(url)
     if existing == sha:
@@ -207,7 +243,7 @@ def write_config(pkg_dir: Path, version: str, folder: str) -> None:
 
 
 def write_conandata(recipe_dir: Path, version: str, url: str, sha: str, origin: str,
-                    log=print) -> None:
+                    log: Log = print_log) -> None:
     block = f"  # {version} originally from: {origin}\n" if origin else ""
     block += f'  "{version}":\n    url: "{url}"\n    sha256: "{sha}"\n'
     path = recipe_dir / "conandata.yml"
@@ -336,7 +372,7 @@ def _template_text(template: str, name: str) -> str:
     return text.replace("@CLASS@", cls).replace("@NAME@", name)
 
 
-def _fetch_base(run_conan, ref: str, center_remote: str, recipe_dir: Path, log) -> None:
+def _fetch_base(run_conan: RunConan, ref: str, center_remote: str, recipe_dir: Path, log: Log) -> None:
     """Copy the recipe (not the sources) of an existing ConanCenter package as a start."""
     run_conan(["download", ref, "-r", center_remote, "--only-recipe"])
     export = Path(run_conan(["cache", "path", ref]).strip())
@@ -355,7 +391,8 @@ def _fetch_base(run_conan, ref: str, center_remote: str, recipe_dir: Path, log) 
 def create_draft(name: str, version: str, archive: Path, raw_url: str, *,
                  base: str = "", template: str = "cmake", folder: str = "", origin: str = "",
                  upload: bool = True, user: str = "", password: str = "", cacert: str = "",
-                 center_remote: str = "conancenter", run_conan=None, log=print,
+                 center_remote: str = "conancenter", run_conan: RunConan | None = None,
+                 log: Log = print_log,
                  root: Path = INDEX_ROOT) -> Path:
     """Create recipes/<name>/... for `version`, or add `version` to an existing recipe."""
     if not NAME_RE.fullmatch(name):
@@ -404,14 +441,15 @@ def create_draft(name: str, version: str, archive: Path, raw_url: str, *,
 
 
 # --------------------------------------------------------------------------- building
-def ensure_remote(run_conan, remote: str, root: Path = INDEX_ROOT, log=print) -> None:
+def ensure_remote(run_conan: RunConan, remote: str, root: Path = INDEX_ROOT, log: Log = print_log) -> None:
     """Register `root` as a local-recipes-index remote (first in the list)."""
-    remotes = {r["name"]: r for r in json.loads(run_conan(["remote", "list", "--format=json"]) or "[]")}
+    listed: list[dict[str, str | bool]] = json.loads(run_conan(["remote", "list", "--format=json"]) or "[]")
+    remotes = {str(r["name"]): r for r in listed}
     have = remotes.get(remote)
     if have is None:
         run_conan(["remote", "add", remote, str(root), "--type=local-recipes-index", "--index", "0"])
         log(f"Added remote '{remote}' -> {root}")
-    elif Path(have["url"]).resolve() != root.resolve():
+    elif Path(str(have["url"])).resolve() != root.resolve():
         run_conan(["remote", "update", remote, "--url", str(root)])
         log(f"Remote '{remote}' now points at {root}")
     if have is not None and not have.get("enabled", True):
@@ -426,14 +464,15 @@ def test_build_args(name: str, version: str, profile: str, internal_remote: str,
 
 
 # --------------------------------------------------------------------------- command line
-def _load_settings() -> dict:
+def _load_settings() -> Settings:
     try:
-        return json.loads(SETTINGS_FILE.read_text())
+        s: Settings = json.loads(SETTINGS_FILE.read_text())
+        return s
     except (OSError, ValueError):
         return {}
 
 
-def _cli_runner(settings: dict, creds: tuple[str, str]):
+def _cli_runner(settings: Settings, creds: tuple[str, str]) -> RunConan:
     def run(args: list[str]) -> str:
         exe = shutil.which(settings.get("conan_exe") or "conan")
         if not exe:
@@ -447,7 +486,7 @@ def _cli_runner(settings: dict, creds: tuple[str, str]):
     return run
 
 
-def _ask_creds(settings: dict, a) -> tuple[str, str]:
+def _ask_creds(settings: Settings, a: argparse.Namespace) -> tuple[str, str]:
     user = a.user or os.environ.get("CONAN_MIRROR_RAW_USER") or settings.get("nexus_user") or ""
     if not user:
         user = input("Nexus username: ").strip()

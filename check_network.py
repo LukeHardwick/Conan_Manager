@@ -53,14 +53,16 @@ def say(tag: str, msg: str) -> None:
     print(f"{tag} {msg}", flush=True)
 
 
-def name_to_str(name) -> str:
+def name_to_str(name: object) -> str:
     """Turn ssl's ((('commonName', 'x'),), ...) tuples into 'CN=x, O=y'."""
     short = {"commonName": "CN", "organizationName": "O", "countryName": "C",
              "organizationalUnitName": "OU"}
-    parts = []
-    for rdn in name or ():
-        for key, value in rdn:
-            parts.append(f"{short.get(key, key)}={value}")
+    parts: list[str] = []
+    for rdn in name if isinstance(name, tuple) else ():
+        for pair in rdn if isinstance(rdn, tuple) else ():
+            if isinstance(pair, tuple) and len(pair) == 2:
+                key, value = str(pair[0]), str(pair[1])
+                parts.append(f"{short.get(key, key)}={value}")
     return ", ".join(parts) or "?"
 
 
@@ -93,14 +95,15 @@ def open_tunnel(proxy: str | None, host: str, port: int, timeout: float) -> sock
     return sock
 
 
-def decode_der(der: bytes) -> dict:
+def decode_der(der: bytes) -> dict[str, object]:
     """Decode a certificate without third-party libs (uses a CPython helper)."""
     pem = ssl.DER_cert_to_PEM_cert(der)
     with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
         f.write(pem)
         path = f.name
     try:
-        return ssl._ssl._test_decode_cert(path)  # type: ignore[attr-defined]
+        info: dict[str, object] = ssl._ssl._test_decode_cert(path)  # type: ignore[attr-defined]
+        return info
     except Exception:
         return {}
     finally:
@@ -112,13 +115,16 @@ def tls_probe(proxy: str | None, url: str, timeout: float, save_dir: Path) -> bo
     u = urlparse(url)
     host, port = u.hostname, u.port or 443
     via = f"via proxy {proxy}" if proxy else "direct"
+    if not host:
+        say(FAIL, f"not a URL with a host name: {url}")
+        return False
 
     # 1) verified handshake using the OS trust store
     ctx = ssl.create_default_context()
     try:
         with open_tunnel(proxy, host, port, timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=host) as tls:
-                cert = tls.getpeercert()
+                cert = tls.getpeercert() or {}
                 issuer = name_to_str(cert.get("issuer"))
                 say(OK, f"TLS to {host} ({via}) verified by the system trust store")
                 print(f"       issuer: {issuer}")
@@ -146,6 +152,9 @@ def tls_probe(proxy: str | None, url: str, timeout: float, save_dir: Path) -> bo
                 der = tls.getpeercert(binary_form=True)
     except Exception as e:  # noqa: BLE001
         say(FAIL, f"unverified handshake also failed: {e}")
+        return False
+    if der is None:
+        say(FAIL, f"{host} presented no certificate")
         return False
     info = decode_der(der)
     issuer = name_to_str(info.get("issuer")) if info else "?"
@@ -192,18 +201,19 @@ def http_probe(proxy: str | None, url: str, timeout: float) -> bool:
 
 def export_bundle(path: Path) -> None:
     """Windows only: dump the machine's ROOT + CA stores into one PEM bundle."""
-    if not hasattr(ssl, "enum_certificates"):
+    if sys.platform == "win32":
+        seen: set[bytes] = set()
+        pems: list[str] = []
+        for store in ("ROOT", "CA"):
+            for der, enc, _trust in ssl.enum_certificates(store):
+                if enc == "x509_asn" and der not in seen:
+                    seen.add(der)
+                    pems.append(ssl.DER_cert_to_PEM_cert(der))
+        path.write_text("".join(pems))
+        say(OK, f"wrote {len(pems)} certificates to {path}")
+        print(f"       In Conan global.conf:  core.net.http:cacert_path = {path}")
+    else:
         say(WARN, "--export-bundle only works on Windows (it reads the Windows cert store).")
-        return
-    seen, pems = set(), []
-    for store in ("ROOT", "CA"):
-        for der, enc, _trust in ssl.enum_certificates(store):  # type: ignore[attr-defined]
-            if enc == "x509_asn" and der not in seen:
-                seen.add(der)
-                pems.append(ssl.DER_cert_to_PEM_cert(der))
-    path.write_text("".join(pems))
-    say(OK, f"wrote {len(pems)} certificates to {path}")
-    print(f"       In Conan global.conf:  core.net.http:cacert_path = {path}")
 
 
 def main() -> int:
