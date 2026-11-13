@@ -183,8 +183,9 @@ first. The profiles named in the manifest must exist in that Conan home.
   Conan's compatibility plugin reuses those binaries for C++17/20/23 profiles, so you
   usually don't need a separate binary per standard. MSVC has no C++11 mode.
 - **Dry run** (checkbox) does everything except the actual upload. Use it for a first test.
-- **Dark mode:** tick *Dark mode* on the Settings tab and *Save*. It takes effect the next
-  time you start the GUI.
+- **Dark mode:** tick *Dark mode* on the Settings tab. It switches straight away and is
+  remembered. On macOS it uses the native light / dark window appearance, whatever the system
+  setting is.
 - Settings, work files and the mirror's Conan home live in `~/.conan_mirror/`.
 - **Type checking:** `python -m mypy` (strict, settings in `pyproject.toml`). Only needed when
   changing the scripts.

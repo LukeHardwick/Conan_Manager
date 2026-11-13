@@ -16,7 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 
 import internal_recipes as ir
 import team_config as tc
-from gui_theme import TAGS, apply_theme
+from gui_theme import TAGS, TREE_TAGS, Theme
 from mirror_core import (APP_NAME, HERE, MANIFEST_FILE, MSVC_VERSIONS, SETTINGS_FILE, WORK_DIR, Cancelled,
                          Conan, ConanError, Mirror, Options, PlanRow, apply_config, load_manifest,
                          load_settings, make_profile, natural_key, open_folder, run_jobs, run_verify,
@@ -202,7 +202,8 @@ class App(tk.Tk):
 
     # ---- layout -----------------------------------------------------------
     def _build_ui(self) -> None:
-        apply_theme(self, bool(self.settings.get("dark_mode")))
+        self.theme = Theme(self)
+        self.theme.apply(bool(self.settings.get("dark_mode")))
         paned = ttk.PanedWindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=6, pady=(6, 0))
         self.nb = ttk.Notebook(paned)
@@ -262,9 +263,8 @@ class App(tk.Tk):
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         tv.frame = frame
-        tv.tag_configure("good", foreground=TAGS["ok"])
-        tv.tag_configure("bad", foreground=TAGS["err"])
-        tv.tag_configure("warn", foreground=TAGS["warn"])
+        for tag, key in TREE_TAGS.items():
+            tv.tag_configure(tag, foreground=TAGS[key])
         return tv
 
     # ---- Search tab -----------------------------------------------------
@@ -951,9 +951,9 @@ class App(tk.Tk):
 
         r = len(fields)
         self.dark_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
-        ttk.Checkbutton(tab, text="Dark mode", variable=self.dark_var).grid(row=r, column=1, sticky="w",
-                                                                           padx=6, pady=3)
-        ttk.Label(tab, text="takes effect the next time the GUI starts", foreground="gray").grid(
+        ttk.Checkbutton(tab, text="Dark mode", variable=self.dark_var, command=self.on_dark_toggle).grid(
+            row=r, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(tab, text="switches and is saved straight away", foreground="gray").grid(
             row=r, column=2, sticky="w")
 
         r += 1
@@ -990,21 +990,23 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "Nexus, ConanCenter and internal remote names must differ.")
             return False
         home_changed = new["conan_home"] != self.settings.get("conan_home")
-        dark = self.dark_var.get()
-        theme_changed = dark != bool(self.settings.get("dark_mode"))
         for k, value in new.items():
             self.settings[k] = value
-        self.settings["dark_mode"] = dark
+        self.settings["dark_mode"] = self.dark_var.get()
         save_settings(self.settings)
         self.log(f"Settings saved to {SETTINGS_FILE}", "ok")
-        if theme_changed:
-            self.log(f"{'Dark' if dark else 'Light'} mode will be used the next time you "
-                     "start the GUI.")
         if home_changed:
             self.conan._home = None
             self.log("Conan home changed - press 'Apply to Conan', then check the Profiles tab.", "err")
             self.after(200, lambda: self.run_task("Loading profiles", self._task_load_profiles))
         return True
+
+    def on_dark_toggle(self) -> None:
+        """Switch now, and remember it (only this setting: the other fields still need Save)."""
+        dark = self.dark_var.get()
+        self.theme.apply(dark)
+        self.settings["dark_mode"] = dark
+        save_settings(self.settings)
 
     def on_apply_conan(self) -> None:
         if self.on_settings_save():
