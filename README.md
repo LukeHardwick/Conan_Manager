@@ -12,6 +12,7 @@ your team only ever talks to Nexus.
 | `internal_recipes.py` | Draft and test recipes for packages that aren't on ConanCenter (also the GUI's *Internal packages* tab) |
 | `team_config.py` | Builds the configuration the team installs with `conan config install` |
 | `check_network.py` | Proxy / Nexus / TLS-interception check (also run from the GUI) |
+| `proxytest.py` | Shows how the proxy answers different tunnel requests, for when Conan gets 407 but curl or a browser doesn't |
 | `recipes/` | Our own recipes, created by `internal_recipes.py` |
 | `mirror.json` | Optional manifest: the packages and profiles to mirror (see [Manifest](#manifest-and-running-without-the-gui)) |
 
